@@ -1,7 +1,7 @@
 /*
  * Animated PNG (APNG) decoding.
  *
- * Parses the APNG frame metadata (acTL/fcTL/fcHD chunks), decodes and
+ * Parses the APNG frame metadata (acTL/fcTL chunks), decodes and
  * composites each frame with stb_image, and returns them as a vertical
  * atlas with per-frame delays — the same layout the stb GIF loader
  * produces — so the crosshair module can treat animated crosshairs like
@@ -18,6 +18,17 @@
 
 static const unsigned char png_signature[8] = {
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a
+};
+
+enum {
+        APNG_DISPOSE_NONE = 0,        /* keep canvas as-is            */
+        APNG_DISPOSE_BACKGROUND = 1,  /* clear frame rect to 0,0,0,0  */
+        APNG_DISPOSE_PREVIOUS = 2     /* restore pre-frame canvas     */
+};
+
+enum {
+        APNG_BLEND_SOURCE = 0, /* frame fully replaces canvas pixels */
+        APNG_BLEND_OVER = 1     /* Porter-Duff "over" alpha blend     */
 };
 
 /*
@@ -103,7 +114,7 @@ static uint32_t apng_crc32(const unsigned char* data, size_t len)
  * Returns the number of bytes written (12 + data_len).
  */
 static size_t apng_write_chunk(unsigned char* out, const char* type,
-                               const unsigned char* data, uint32_t data_len)
+                                const unsigned char* data, uint32_t data_len)
 {
         apng_write_be32(out, data_len);
         memcpy(out + 4, type, 4);
@@ -113,6 +124,28 @@ static size_t apng_write_chunk(unsigned char* out, const char* type,
         uint32_t crc = apng_crc32(out + 4, 4 + data_len);
         apng_write_be32(out + 8 + data_len, crc);
         return 12 + data_len; /* length(4) + type(4) + data + crc(4) */
+}
+
+/*
+ * Step to the next PNG chunk after *pos and advance *pos past it.
+ *
+ * data/len: file contents; *pos: offset of the chunk currently under
+ *           inspection (must point at a chunk length field);
+ * ctype/clen/cdata: set to the chunk's 4-char type, payload length, and
+ *           payload pointer on success.
+ * Returns 1 on success, 0 when no complete chunk remains in the file.
+ */
+static int apng_next_chunk(const unsigned char* data, size_t len,
+                           size_t* pos, const unsigned char** ctype,
+                           uint32_t* clen, const unsigned char** cdata)
+{
+        if (*pos + 12 > len) return 0;
+        *clen = apng_read_be32(data + *pos);
+        *ctype = data + *pos + 4;
+        *cdata = data + *pos + 8;
+        if (*pos + 12 + *clen > len) return 0;
+        *pos += 12 + *clen;
+        return 1;
 }
 
 typedef struct apng_frame_info {
@@ -162,8 +195,8 @@ static void apng_frame_append_idat(apng_frame_info_t* f,
  * out_w/out_h: set to the decoded pixel dimensions on success.
  */
 static stbi_uc* apng_decode_frame(const apng_frame_info_t* f,
-                                   const unsigned char* ihdr_raw,
-                                   int* out_w, int* out_h)
+                                    const unsigned char* ihdr_raw,
+                                    int* out_w, int* out_h)
 {
         /* build a new IHDR with the frame's dimensions */
         unsigned char ihdr[13];
@@ -206,9 +239,9 @@ static stbi_uc* apng_decode_frame(const apng_frame_info_t* f,
  * fw/fh:   frame dimensions.
  */
 static void apng_blend_over(unsigned char* dst, const unsigned char* src,
-                            uint32_t canvas_w, uint32_t canvas_h,
-                            uint32_t x_off, uint32_t y_off,
-                            uint32_t fw, uint32_t fh)
+                             uint32_t canvas_w, uint32_t canvas_h,
+                             uint32_t x_off, uint32_t y_off,
+                             uint32_t fw, uint32_t fh)
 {
         for (uint32_t y = 0; y < fh; y++) {
                 if (y + y_off >= canvas_h) break;
@@ -246,9 +279,9 @@ static void apng_blend_over(unsigned char* dst, const unsigned char* src,
  * fw/fh:   frame dimensions.
  */
 static void apng_blend_source(unsigned char* dst, const unsigned char* src,
-                              uint32_t canvas_w, uint32_t canvas_h,
-                              uint32_t x_off, uint32_t y_off,
-                              uint32_t fw, uint32_t fh)
+                               uint32_t canvas_w, uint32_t canvas_h,
+                               uint32_t x_off, uint32_t y_off,
+                               uint32_t fw, uint32_t fh)
 {
         for (uint32_t y = 0; y < fh; y++) {
                 if (y + y_off >= canvas_h) break;
@@ -271,8 +304,8 @@ static void apng_blend_source(unsigned char* dst, const unsigned char* src,
  * w/h:          region size.
  */
 static void apng_clear_region(unsigned char* canvas, uint32_t canvas_w,
-                              uint32_t canvas_h, uint32_t x, uint32_t y,
-                              uint32_t w, uint32_t h)
+                               uint32_t canvas_h, uint32_t x, uint32_t y,
+                               uint32_t w, uint32_t h)
 {
         for (uint32_t row = y; row < y + h && row < canvas_h; row++) {
                 size_t off = (row * canvas_w + x) * 4;
@@ -280,6 +313,191 @@ static void apng_clear_region(unsigned char* canvas, uint32_t canvas_w,
                 if (x + w > canvas_w) cw = canvas_w - x;
                 memset(canvas + off, 0, cw * 4);
         }
+}
+
+/*
+ * Convert a frame's delay, stored as a num/den fraction of a second,
+ * into integer milliseconds. A zero denominator means 100 (centiseconds)
+ * per the APNG spec; non-positive results clamp to 100 ms so animation
+ * never stalls.
+ */
+static int apng_delay_ms(uint16_t delay_num, uint16_t delay_den)
+{
+        if (delay_den == 0)
+                delay_den = 100;
+        int delay_ms = (int)((uint32_t)delay_num * 1000 / delay_den);
+        return delay_ms > 0 ? delay_ms : 100;
+}
+
+/*
+ * Scan the chunk stream for the acTL chunk and return its frame count.
+ * Returns 0 if the file has no acTL chunk (i.e. it is not an APNG).
+ */
+static uint32_t apng_count_frames(const unsigned char* file_data, size_t file_len)
+{
+        uint32_t num_frames = 0;
+        size_t pos = 8; /* skip the 8-byte PNG signature */
+        const unsigned char* ctype;
+        const unsigned char* cdata;
+        uint32_t clen;
+        while (apng_next_chunk(file_data, file_len, &pos, &ctype, &clen, &cdata)) {
+                if (memcmp(ctype, "acTL", 4) == 0 && clen >= 8)
+                        num_frames = apng_read_be32(cdata);
+                if (memcmp(ctype, "IEND", 4) == 0) break;
+        }
+        return num_frames;
+}
+
+/*
+ * Walk the chunk stream, recording each frame's fcTL metadata and its
+ * compressed image data (plain IDAT for a first frame without fcTL,
+ * fdAT for all others).
+ *
+ * num_frames: frame count from acTL — frames[] must hold that many slots;
+ * frames:     output array, filled in order of appearance.
+ * Returns the number of frames actually collected (may be fewer than
+ * num_frames for a truncated file, or < 1 if the file has no frames).
+ */
+static int apng_collect_frames(const unsigned char* file_data, size_t file_len,
+                               uint32_t num_frames, apng_frame_info_t* frames)
+{
+        int frame_idx = -1; /* index into frames[], -1 until first fcTL */
+        int seen_fcTL = 0;
+        size_t pos = 8;
+        const unsigned char* ctype;
+        const unsigned char* cdata;
+        uint32_t clen;
+        while (apng_next_chunk(file_data, file_len, &pos, &ctype, &clen, &cdata)) {
+                if (memcmp(ctype, "fcTL", 4) == 0 && clen >= 26) {
+                        if (++frame_idx >= (int)num_frames) break;
+                        seen_fcTL = 1;
+
+                        apng_frame_info_t* f = &frames[frame_idx];
+                        f->width      = apng_read_be32(cdata + 4);
+                        f->height     = apng_read_be32(cdata + 8);
+                        f->x_offset   = apng_read_be32(cdata + 12);
+                        f->y_offset   = apng_read_be32(cdata + 16);
+                        f->delay_num  = apng_read_be16(cdata + 20);
+                        f->delay_den  = apng_read_be16(cdata + 22);
+                        f->dispose_op = cdata[24];
+                        f->blend_op   = cdata[25];
+                } else if (memcmp(ctype, "IDAT", 4) == 0) {
+                        /* An IDAT before any fcTL belongs to a first frame
+                         * that has no fcTL (it uses the IHDR dimensions) */
+                        if (!seen_fcTL)
+                                apng_frame_append_idat(&frames[0], cdata, clen);
+                } else if (memcmp(ctype, "fdAT", 4) == 0 && clen > 4) {
+                        /* fdAT: first 4 bytes are the sequence number,
+                         * the rest is IDAT-equivalent data */
+                        if (frame_idx >= 0)
+                                apng_frame_append_idat(&frames[frame_idx],
+                                                       cdata + 4, clen - 4);
+                } else if (memcmp(ctype, "IEND", 4) == 0) {
+                        break;
+                }
+        }
+        return frame_idx + 1;
+}
+
+/*
+ * Decode and composite every frame in order, producing one fully-composited
+ * canvas per frame in the atlas (vertical strip, one canvas per row), and
+ * fill in the per-frame delays.
+ *
+ * The running canvas is composited frame over frame: each frame is first
+ * blended in (blend_op), the result is copied into its atlas row, and then
+ * the frame's dispose_op modifies the canvas for the next frame.
+ * Frames without image data are skipped — their atlas row keeps the
+ * canvas as it was.
+ *
+ * frames:      decoded frame metadata (num_frames entries);
+ * num_frames:  frame count;
+ * ihdr_data:   the 13 IHDR data bytes (bit depth / color type / filter);
+ * canvas_w/canvas_h: per-frame canvas dimensions;
+ * delays:      output, num_frames entries (milliseconds);
+ * atlas:       output, num_frames * canvas_w * canvas_h * 4 bytes
+ *              (caller-allocated, zero-filled).
+ */
+static void apng_compose_frames(const apng_frame_info_t* frames, int num_frames,
+                                const unsigned char* ihdr_data,
+                                uint32_t canvas_w, uint32_t canvas_h,
+                                int* delays, unsigned char* atlas)
+{
+        size_t frame_stride = (size_t)canvas_w * canvas_h * 4;
+        unsigned char* canvas = calloc(1, frame_stride);
+        unsigned char* dispose_prev = NULL; /* pre-frame canvas for DISPOSE_PREVIOUS */
+        if (!canvas) return; /* atlas stays zero-filled */
+
+        for (int i = 0; i < num_frames; i++) {
+                const apng_frame_info_t* f = &frames[i];
+
+                delays[i] = apng_delay_ms(f->delay_num, f->delay_den);
+
+                /* snapshot the canvas before compositing so DISPOSE_PREVIOUS
+                 * can restore it after this frame is done */
+                if (f->dispose_op == APNG_DISPOSE_PREVIOUS) {
+                        if (!dispose_prev)
+                                dispose_prev = malloc(frame_stride);
+                        if (dispose_prev)
+                                memcpy(dispose_prev, canvas, frame_stride);
+                }
+
+                /* frame has no image data: its atlas row keeps the canvas as-is */
+                if (f->idat_size == 0) {
+                        KROSSHAIR_LOG("[APNG] frame %d has no image data, skipping\n", i);
+                        memcpy(atlas + i * frame_stride, canvas, frame_stride);
+                        continue;
+                }
+
+                int fw, fh;
+                stbi_uc* frame_pixels = apng_decode_frame(f, ihdr_data, &fw, &fh);
+                if (!frame_pixels) {
+                        KROSSHAIR_LOG("[APNG] failed to decode frame %d\n", i);
+                        memcpy(atlas + i * frame_stride, canvas, frame_stride);
+                        continue;
+                }
+
+                if (f->blend_op == APNG_BLEND_SOURCE)
+                        apng_blend_source(canvas, frame_pixels, canvas_w, canvas_h,
+                                          f->x_offset, f->y_offset,
+                                          f->width, f->height);
+                else /* APNG_BLEND_OVER */
+                        apng_blend_over(canvas, frame_pixels, canvas_w, canvas_h,
+                                        f->x_offset, f->y_offset,
+                                        f->width, f->height);
+                stbi_image_free(frame_pixels);
+
+                /* copy the composited canvas into this frame's atlas row */
+                memcpy(atlas + i * frame_stride, canvas, frame_stride);
+
+                /* apply dispose_op — it only affects the canvas for the NEXT frame */
+                switch (f->dispose_op) {
+                case APNG_DISPOSE_BACKGROUND:
+                        apng_clear_region(canvas, canvas_w, canvas_h,
+                                          f->x_offset, f->y_offset,
+                                          f->width, f->height);
+                        break;
+                case APNG_DISPOSE_PREVIOUS:
+                        if (dispose_prev)
+                                memcpy(canvas, dispose_prev, frame_stride);
+                        break;
+                default: /* APNG_DISPOSE_NONE: leave the canvas as-is */
+                        break;
+                }
+        }
+
+        free(canvas);
+        free(dispose_prev);
+}
+
+/*
+ * Free a frames array allocated by calloc and each frame's IDAT buffer.
+ */
+static void apng_free_frame_infos(apng_frame_info_t* frames, uint32_t count)
+{
+        for (uint32_t i = 0; i < count; i++)
+                free(frames[i].idat_data);
+        free(frames);
 }
 
 /*
@@ -301,102 +519,36 @@ unsigned char* load_apng(const unsigned char* file_data, size_t file_len,
 {
         apng_crc32_init();
 
+        /* signature + at least one IHDR chunk: 8 (sig) + 12 (hdr) + 13 (IHDR data) */
         if (file_len < 8 + 25 || memcmp(file_data, png_signature, 8) != 0) {
                 KROSSHAIR_LOG("[APNG] not a PNG file\n");
                 return NULL;
         }
 
-        /* parse IHDR */
-        size_t pos = 8;
-        uint32_t chunk_len = apng_read_be32(file_data + pos);
-        if (memcmp(file_data + pos + 4, "IHDR", 4) != 0 || chunk_len != 13) {
+        /* IHDR: the canvas the frames are composited into */
+        if (apng_read_be32(file_data + 8) != 13 ||
+            memcmp(file_data + 12, "IHDR", 4) != 0) {
                 KROSSHAIR_LOG("[APNG] missing IHDR\n");
                 return NULL;
         }
-        const unsigned char* ihdr_data = file_data + pos + 8;
+        const unsigned char* ihdr_data = file_data + 16;
         uint32_t canvas_w = apng_read_be32(ihdr_data);
         uint32_t canvas_h = apng_read_be32(ihdr_data + 4);
 
-        /* first pass: find acTL and count frames */
-        uint32_t num_frames = 0;
-        int found_actl = 0;
-        size_t scan = 8;
-        while (scan + 12 <= file_len) {
-                uint32_t clen = apng_read_be32(file_data + scan);
-                const unsigned char* ctype = file_data + scan + 4;
-                if (scan + 12 + clen > file_len) break;
-                if (memcmp(ctype, "acTL", 4) == 0 && clen >= 8) {
-                        num_frames = apng_read_be32(file_data + scan + 8);
-                        found_actl = 1;
-                }
-                if (memcmp(ctype, "IEND", 4) == 0) break;
-                scan += 12 + clen;
-        }
-
-        if (!found_actl || num_frames < 1) {
+        uint32_t num_frames = apng_count_frames(file_data, file_len);
+        if (num_frames == 0) {
                 KROSSHAIR_LOG("[APNG] no acTL chunk or 0 frames (not an APNG)\n");
                 return NULL;
         }
 
-        /* allocate frame info array */
         apng_frame_info_t* frames = calloc(num_frames, sizeof(apng_frame_info_t));
         if (!frames) return NULL;
 
-        /* second pass: collect fcTL + IDAT/fdAT data per frame */
-        int current_frame = -1; /* index into frames[] */
-        int first_frame_is_default = 0; /* fcTL before first IDAT? */
-        int seen_idat = 0;
-
-        pos = 8;
-        while (pos + 12 <= file_len) {
-                uint32_t clen = apng_read_be32(file_data + pos);
-                const unsigned char* ctype = file_data + pos + 4;
-                const unsigned char* cdata = file_data + pos + 8;
-                if (pos + 12 + clen > file_len) break;
-
-                if (memcmp(ctype, "fcTL", 4) == 0 && clen >= 26) {
-                        current_frame++;
-                        if (current_frame >= (int)num_frames) break;
-
-                        if (!seen_idat && current_frame == 0)
-                                first_frame_is_default = 1;
-
-                        apng_frame_info_t* f = &frames[current_frame];
-                        f->width     = apng_read_be32(cdata + 4);
-                        f->height    = apng_read_be32(cdata + 8);
-                        f->x_offset  = apng_read_be32(cdata + 12);
-                        f->y_offset  = apng_read_be32(cdata + 16);
-                        f->delay_num = apng_read_be16(cdata + 20);
-                        f->delay_den = apng_read_be16(cdata + 22);
-                        f->dispose_op = cdata[24];
-                        f->blend_op   = cdata[25];
-                } else if (memcmp(ctype, "IDAT", 4) == 0) {
-                        seen_idat = 1;
-                        if (first_frame_is_default && current_frame == 0) {
-                                apng_frame_append_idat(&frames[0], cdata, clen);
-                        }
-                } else if (memcmp(ctype, "fdAT", 4) == 0 && clen > 4) {
-                        /* fdAT: first 4 bytes are sequence number, rest is
-                         * IDAT-equivalent data */
-                        if (current_frame >= 0 && current_frame < (int)num_frames) {
-                                apng_frame_append_idat(&frames[current_frame],
-                                                       cdata + 4, clen - 4);
-                        }
-                } else if (memcmp(ctype, "IEND", 4) == 0) {
-                        break;
-                }
-
-                pos += 12 + clen;
-        }
-
-        /* the actual number of frames we collected may be less than num_frames
-         * (e.g., truncated file) */
-        int actual_frames = current_frame + 1;
+        int actual_frames = apng_collect_frames(file_data, file_len,
+                                                num_frames, frames);
         if (actual_frames < 1) {
                 KROSSHAIR_LOG("[APNG] no frames found\n");
-                for (uint32_t i = 0; i < num_frames; i++)
-                        free(frames[i].idat_data);
-                free(frames);
+                apng_free_frame_infos(frames, num_frames);
                 return NULL;
         }
         if (actual_frames < (int)num_frames) {
@@ -404,83 +556,20 @@ unsigned char* load_apng(const unsigned char* file_data, size_t file_len,
                               num_frames, actual_frames);
         }
 
-        /* build vertical atlas: each row is canvas_w x canvas_h */
         size_t frame_stride = (size_t)canvas_w * canvas_h * 4;
         unsigned char* atlas = calloc(actual_frames, frame_stride);
         int* delays = malloc(sizeof(int) * actual_frames);
-        unsigned char* canvas = calloc(1, frame_stride);
-        unsigned char* prev_canvas = NULL; /* for dispose_op = APNG_DISPOSE_OP_PREVIOUS */
-        if (!atlas || !delays || !canvas) {
+        if (!atlas || !delays) {
                 free(atlas);
                 free(delays);
-                free(canvas);
-                for (uint32_t i = 0; i < num_frames; i++)
-                        free(frames[i].idat_data);
-                free(frames);
+                apng_free_frame_infos(frames, num_frames);
                 return NULL;
         }
 
-        for (int i = 0; i < actual_frames; i++) {
-                apng_frame_info_t* f = &frames[i];
+        apng_compose_frames(frames, actual_frames, ihdr_data,
+                            canvas_w, canvas_h, delays, atlas);
 
-                /* compute delay in ms */
-                uint16_t den = f->delay_den ? f->delay_den : 100;
-                int delay_ms = (int)((uint32_t)f->delay_num * 1000 / den);
-                if (delay_ms <= 0) delay_ms = 100;
-                delays[i] = delay_ms;
-
-                /* save canvas for APNG_DISPOSE_OP_PREVIOUS before compositing */
-                if (f->dispose_op == 2) { /* APNG_DISPOSE_OP_PREVIOUS */
-                        if (!prev_canvas) prev_canvas = malloc(frame_stride);
-                        if (prev_canvas) memcpy(prev_canvas, canvas, frame_stride);
-                }
-
-                /* decode this frame's pixels */
-                if (f->idat_size == 0) {
-                        KROSSHAIR_LOG("[APNG] frame %d has no image data, skipping\n", i);
-                        memcpy(atlas + i * frame_stride, canvas, frame_stride);
-                        continue;
-                }
-
-                int fw, fh;
-                stbi_uc* fpix = apng_decode_frame(f, ihdr_data, &fw, &fh);
-                if (!fpix) {
-                        KROSSHAIR_LOG("[APNG] failed to decode frame %d\n", i);
-                        memcpy(atlas + i * frame_stride, canvas, frame_stride);
-                        continue;
-                }
-
-                /* apply blend_op */
-                if (f->blend_op == 0) { /* APNG_BLEND_OP_SOURCE */
-                        apng_blend_source(canvas, fpix, canvas_w, canvas_h,
-                                          f->x_offset, f->y_offset,
-                                          f->width, f->height);
-                } else { /* APNG_BLEND_OP_OVER */
-                        apng_blend_over(canvas, fpix, canvas_w, canvas_h,
-                                        f->x_offset, f->y_offset,
-                                        f->width, f->height);
-                }
-                stbi_image_free(fpix);
-
-                /* copy composited canvas to atlas row */
-                memcpy(atlas + i * frame_stride, canvas, frame_stride);
-
-                /* apply dispose_op (affects canvas for NEXT frame) */
-                if (f->dispose_op == 1) { /* APNG_DISPOSE_OP_BACKGROUND */
-                        apng_clear_region(canvas, canvas_w, canvas_h,
-                                          f->x_offset, f->y_offset,
-                                          f->width, f->height);
-                } else if (f->dispose_op == 2) { /* APNG_DISPOSE_OP_PREVIOUS */
-                        if (prev_canvas) memcpy(canvas, prev_canvas, frame_stride);
-                }
-                /* dispose_op 0 (APNG_DISPOSE_OP_NONE): leave canvas as-is */
-        }
-
-        free(canvas);
-        free(prev_canvas);
-        for (uint32_t i = 0; i < num_frames; i++)
-                free(frames[i].idat_data);
-        free(frames);
+        apng_free_frame_infos(frames, num_frames);
 
         *out_width  = (int)canvas_w;
         *out_height = (int)canvas_h;
@@ -494,4 +583,3 @@ unsigned char* load_apng(const unsigned char* file_data, size_t file_len,
 }
 
 /* ────────────────── end APNG loader ─────────────────── */
-
