@@ -20,17 +20,34 @@ static const unsigned char png_signature[8] = {
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a
 };
 
+/*
+ * Read a big-endian uint32 from p[0..3].
+ *
+ * p: pointer to 4 consecutive bytes (e.g. a PNG chunk length or offset).
+ * Returns the value in host byte order.
+ */
 static uint32_t apng_read_be32(const unsigned char* p)
 {
         return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
 
+/*
+ * Read a big-endian uint16 from p[0..1].
+ *
+ * p: pointer to 2 consecutive bytes (e.g. an fcTL delay numerator).
+ * Returns the value in host byte order.
+ */
 static uint16_t apng_read_be16(const unsigned char* p)
 {
         return ((uint16_t)p[0] << 8) | (uint16_t)p[1];
 }
 
+/*
+ * Write value v as a big-endian uint32 into p[0..3].
+ *
+ * p: pointer to 4 writable bytes; v: the value to encode.
+ */
 static void apng_write_be32(unsigned char* p, uint32_t v)
 {
         p[0] = (v >> 24) & 0xff;
@@ -43,6 +60,11 @@ static void apng_write_be32(unsigned char* p, uint32_t v)
 static uint32_t apng_crc32_table[256];
 static int apng_crc32_table_ready = 0;
 
+/*
+ * Lazily build the 256-entry CRC32 lookup table (reflected polynomial
+ * 0xEDB88320). No parameters; safe to call repeatedly — the table is
+ * only generated once.
+ */
 static void apng_crc32_init(void)
 {
         if (apng_crc32_table_ready) return;
@@ -55,6 +77,13 @@ static void apng_crc32_init(void)
         apng_crc32_table_ready = 1;
 }
 
+/*
+ * Compute the CRC32 checksum over a byte range (PNG's algorithm).
+ *
+ * data: pointer to the bytes to checksum (typically chunk type + data);
+ * len:  number of bytes.
+ * Returns the 32-bit CRC.
+ */
 static uint32_t apng_crc32(const unsigned char* data, size_t len)
 {
         uint32_t crc = 0xFFFFFFFF;
@@ -63,7 +92,16 @@ static uint32_t apng_crc32(const unsigned char* data, size_t len)
         return crc ^ 0xFFFFFFFF;
 }
 
-/* write a complete PNG chunk: length + type + data + crc */
+/*
+ * Serialize one complete PNG chunk (length + 4-char type + data + CRC32)
+ * into out, which must have room for 12 + data_len bytes.
+ *
+ * out:     destination buffer;
+ * type:    4-character chunk type ("IHDR", "IDAT", "IEND", ...);
+ * data:    chunk payload, or NULL when data_len is 0 (e.g. IEND);
+ * data_len: payload length in bytes.
+ * Returns the number of bytes written (12 + data_len).
+ */
 static size_t apng_write_chunk(unsigned char* out, const char* type,
                                const unsigned char* data, uint32_t data_len)
 {
@@ -88,6 +126,15 @@ typedef struct apng_frame_info {
         size_t idat_capacity;
 } apng_frame_info_t;
 
+/*
+ * Append more compressed image data to a frame's IDAT buffer, growing
+ * the buffer (doubled realloc) as needed.
+ *
+ * f:    frame whose IDAT data is being accumulated;
+ * data: new bytes to append (an IDAT payload, or fdAT payload minus its
+ *       4-byte sequence number);
+ * len:  number of bytes to append.
+ */
 static void apng_frame_append_idat(apng_frame_info_t* f,
                                     const unsigned char* data, size_t len)
 {
@@ -107,11 +154,16 @@ static void apng_frame_append_idat(apng_frame_info_t* f,
  * then decode it with stbi.  Returns RGBA pixels (caller must
  * stbi_image_free), or NULL on failure.
  *
- * ihdr_raw: the 13 bytes of the original IHDR *data* (no length/type/crc)
+ * f:        frame to decode (dimensions + accumulated IDAT data);
+ * ihdr_raw: the 13 bytes of the original IHDR *data* (no
+ *           length/type/crc) — bit depth, color type, compression,
+ *           filter and interlace come from it; width/height are
+ *           overwritten with the frame's own size;
+ * out_w/out_h: set to the decoded pixel dimensions on success.
  */
 static stbi_uc* apng_decode_frame(const apng_frame_info_t* f,
-                                  const unsigned char* ihdr_raw,
-                                  int* out_w, int* out_h)
+                                   const unsigned char* ihdr_raw,
+                                   int* out_w, int* out_h)
 {
         /* build a new IHDR with the frame's dimensions */
         unsigned char ihdr[13];
@@ -142,7 +194,17 @@ static stbi_uc* apng_decode_frame(const apng_frame_info_t* f,
         return pixels;
 }
 
-/* alpha-composite src over dst (premultiply-aware, straight alpha) */
+/*
+ * Alpha-composite the src frame RGBA pixels over the dst canvas using
+ * the standard Porter-Duff "over" operator (straight alpha, no
+ * premultiplication). Pixels outside the canvas are skipped.
+ *
+ * dst:     destination canvas (rgba, canvas_w x canvas_h) — updated in place;
+ * src:     source frame pixels (rgba, fw x fh);
+ * canvas_w/canvas_h: canvas dimensions;
+ * x_off/y_off: top-left position of the frame on the canvas;
+ * fw/fh:   frame dimensions.
+ */
 static void apng_blend_over(unsigned char* dst, const unsigned char* src,
                             uint32_t canvas_w, uint32_t canvas_h,
                             uint32_t x_off, uint32_t y_off,
@@ -172,7 +234,17 @@ static void apng_blend_over(unsigned char* dst, const unsigned char* src,
         }
 }
 
-/* copy src frame pixels into canvas at offset (source replace, no blending) */
+/*
+ * Copy src frame RGBA pixels into the dst canvas at (x_off, y_off) with
+ * no blending (PNG "source" blend operator) — src pixels fully replace
+ * the canvas pixels they cover. Pixels outside the canvas are skipped.
+ *
+ * dst:     destination canvas (rgba, canvas_w x canvas_h) — updated in place;
+ * src:     source frame pixels (rgba, fw x fh);
+ * canvas_w/canvas_h: canvas dimensions;
+ * x_off/y_off: top-left position of the frame on the canvas;
+ * fw/fh:   frame dimensions.
+ */
 static void apng_blend_source(unsigned char* dst, const unsigned char* src,
                               uint32_t canvas_w, uint32_t canvas_h,
                               uint32_t x_off, uint32_t y_off,
@@ -188,7 +260,16 @@ static void apng_blend_source(unsigned char* dst, const unsigned char* src,
         }
 }
 
-/* clear a region to transparent black */
+/*
+ * Clear a rectangular region of the canvas to transparent black
+ * (rgba 0,0,0,0) — used to apply the "dispose to background" operator.
+ * The rectangle is clamped to the canvas bounds.
+ *
+ * canvas:       destination canvas (rgba, canvas_w x canvas_h) — updated in place;
+ * canvas_w/canvas_h: canvas dimensions;
+ * x/y:          top-left corner of the region;
+ * w/h:          region size.
+ */
 static void apng_clear_region(unsigned char* canvas, uint32_t canvas_w,
                               uint32_t canvas_h, uint32_t x, uint32_t y,
                               uint32_t w, uint32_t h)
@@ -202,17 +283,21 @@ static void apng_clear_region(unsigned char* canvas, uint32_t canvas_w,
 }
 
 /*
- * Load an APNG file and return a vertical atlas of fully-composited frames,
- * identical in layout to what stbi_load_gif_from_memory produces.
+ * Load an APNG file and return a vertical atlas of fully-composited
+ * frames, identical in layout to what stbi_load_gif_from_memory
+ * produces.
  *
- * Returns RGBA pixel data (free with free()) or NULL on failure.
- * *out_width / *out_height are per-frame dimensions.
- * *out_frames is the frame count.
- * *out_delays is malloc'd array of per-frame delays in ms (free with free()).
+ * file_data/file_len: raw file contents in memory;
+ * out_width/out_height: set to the per-frame (canvas) pixel dimensions;
+ * out_frames:          set to the decoded frame count;
+ * out_delays:          set to a malloc'd array of per-frame delays in ms
+ *                      (free with free()).
+ * Returns the RGBA atlas (free with free()) or NULL if the file is not
+ * an animated PNG.
  */
 unsigned char* load_apng(const unsigned char* file_data, size_t file_len,
-                                int* out_width, int* out_height,
-                                int* out_frames, int** out_delays)
+                         int* out_width, int* out_height,
+                         int* out_frames, int** out_delays)
 {
         apng_crc32_init();
 
