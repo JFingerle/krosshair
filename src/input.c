@@ -25,6 +25,7 @@
 #include "../include/keys.h"
 #include "../include/krosshair.h"
 
+/* 1 while the crosshair overlay is visible (toggled by the hotkey). */
 volatile int crosshair_visible = 1;
 
 #define KROSSHAIR_MAX_KEYS 8
@@ -39,6 +40,9 @@ static int kh_input_fd_count;
 /* Minimum hold (ms) before the hotkey fires; a short press toggles, a tap under
  * this duration cancels. */
 #define KROSSHAIR_HOTKEY_HOLD_MS 50
+
+/* Default 100 ms select() tick; doubles as the device rescan interval. */
+#define KROSSHAIR_RESYNC_TICK_MS 100
 
 static int kh_keys_down;        /* bitmask of required keys currently pressed */
 static int kh_combo_active;     /* 1 while the full combo is held */
@@ -55,45 +59,51 @@ static int kh_key_index(int code)
     return -1;
 }
 
+/*
+ * Parse the hotkey environment variable into the required-key list.
+ *
+ * Reads KROSSHAIR_HOTKEY_TOGGLE (default "SHIFT_R+F9"); tokens are split
+ * on '+', whitespace-trimmed and resolved via kh_key_from_name(). Unknown
+ * and duplicate tokens are skipped; if nothing remains, the default
+ * combo is used.
+ */
 static void parse_hotkey(void)
 {
-    char buf[256];
-    const char* src = getenv("KROSSHAIR_HOTKEY_TOGGLE");
-    if (!src || src[0] == '\0')
-        src = "SHIFT_R+F9";
+    const char* hotkey = getenv("KROSSHAIR_HOTKEY_TOGGLE");
+    if (!hotkey || hotkey[0] == '\0')
+        hotkey = "SHIFT_R+F9";
 
-    strncpy(kh_hotkey_display, src, sizeof(kh_hotkey_display) - 1);
+    strncpy(kh_hotkey_display, hotkey, sizeof(kh_hotkey_display) - 1);
     kh_hotkey_display[sizeof(kh_hotkey_display) - 1] = '\0';
 
-    strncpy(buf, src, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
+    char scratch[256];
+    strncpy(scratch, hotkey, sizeof(scratch) - 1);
+    scratch[sizeof(scratch) - 1] = '\0';
 
     int count = 0;
-    char* tok = strtok(buf, "+");
-    while (tok) {
-        while (*tok == ' ' || *tok == '\t')
-            tok++;
-        char* end = tok + strlen(tok);
-        while (end > tok &&
+    char* token = strtok(scratch, "+");
+    while (token) {
+        /* trim leading and trailing whitespace */
+        while (*token == ' ' || *token == '\t')
+            token++;
+        char* end = token + strlen(token);
+        while (end > token &&
                (end[-1] == ' ' || end[-1] == '\t' ||
                 end[-1] == '\r' || end[-1] == '\n'))
             end--;
         *end = '\0';
 
-        if (*tok) {
-            int code = kh_key_from_name(tok);
+        if (*token) {
+            int code = kh_key_from_name(token);
             if (code < 0) {
-                KROSSHAIR_LOG("[KROSSHAIR] unknown hotkey token '%s', skipping\n", tok);
+                KROSSHAIR_LOG("[KROSSHAIR] unknown hotkey token '%s', skipping\n", token);
             } else {
-                int dup = 0;
-                for (int i = 0; i < count; ++i)
-                    if (kh_required_keys[i] == code)
-                        dup = 1;
-                if (!dup && count < KROSSHAIR_MAX_KEYS)
+                int bit = kh_key_index(code);
+                if (bit < 0 && count < KROSSHAIR_MAX_KEYS)
                     kh_required_keys[count++] = code;
             }
         }
-        tok = strtok(NULL, "+");
+        token = strtok(NULL, "+");
     }
     kh_required_key_count = count;
 
@@ -105,6 +115,7 @@ static void parse_hotkey(void)
     }
 }
 
+/* Close all open input device file descriptors. */
 static void close_devices(void)
 {
     for (int i = 0; i < kh_input_fd_count; ++i)
@@ -112,15 +123,22 @@ static void close_devices(void)
     kh_input_fd_count = 0;
 }
 
+/*
+ * Open every /dev/input/event* node that answers the evdev version ioctl.
+ * Previously opened devices are closed first, so this is safe to call
+ * repeatedly (the rescan tick uses it to pick up new/virtual keyboards).
+ *
+ * Returns the number of devices now open.
+ */
 static int scan_devices(void)
 {
     close_devices();
     int count = 0;
-    DIR* d = opendir("/dev/input");
-    if (!d)
+    DIR* dir = opendir("/dev/input");
+    if (!dir)
         return 0;
     struct dirent* ent;
-    while ((ent = readdir(d))) {
+    while ((ent = readdir(dir))) {
         if (strncmp(ent->d_name, "event", 5) != 0)
             continue;
         if (count >= KROSSHAIR_MAX_INPUT_DEVS)
@@ -130,14 +148,14 @@ static int scan_devices(void)
         int fd = open(path, O_RDONLY | O_NONBLOCK);
         if (fd < 0)
             continue;
-        int ver = 0;
-        if (ioctl(fd, EVIOCGVERSION, &ver) < 0) {
+        int version = 0;
+        if (ioctl(fd, EVIOCGVERSION, &version) < 0) {
             close(fd);
             continue;
         }
         kh_input_fds[count++] = fd;
     }
-    closedir(d);
+    closedir(dir);
     kh_input_fd_count = count;
     return count;
 }
@@ -177,84 +195,162 @@ static void kh_resync_state(void)
     kh_keys_down = mask;
 }
 
+/* Milliseconds elapsed between two CLOCK_MONOTONIC timestamps. */
+static long kh_elapsed_ms(const struct timespec* start, const struct timespec* now)
+{
+    return (now->tv_sec - start->tv_sec) * 1000 +
+           (now->tv_nsec - start->tv_nsec) / 1000000;
+}
+
+/*
+ * Compute the select() timeout in ms.
+ *
+ * Normally the 100 ms resync tick; but while the combo is held and not yet
+ * fired, wake exactly at the hold boundary even though held keys emit no
+ * new events. No busy-wait.
+ */
+static long kh_select_timeout_ms(void)
+{
+    if (!kh_combo_active || kh_combo_fired)
+        return KROSSHAIR_RESYNC_TICK_MS;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long held_ms = kh_elapsed_ms(&kh_combo_down_ts, &now);
+    long remain = KROSSHAIR_HOTKEY_HOLD_MS - held_ms;
+    if (remain < 0)
+        remain = 0;
+    return remain < KROSSHAIR_RESYNC_TICK_MS ? remain : KROSSHAIR_RESYNC_TICK_MS;
+}
+
+/*
+ * Read all pending events from one input device, applying each to the
+ * required-keys bitmask.
+ *
+ * fd  The device file descriptor.
+ *
+ * Returns 1 if the device should be removed from the watch list
+ * (unreadable or vanished), 0 otherwise.
+ */
+static int kh_drain_device(int fd)
+{
+    for (;;) {
+        struct input_event ev;
+        ssize_t n = read(fd, &ev, sizeof(ev));
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EINTR)
+                return 0; /* buffer drained */
+            close(fd);
+            return 1;
+        }
+        if (n == 0) { /* EOF: device vanished */
+            close(fd);
+            return 1;
+        }
+        if (n < (ssize_t)sizeof(ev))
+            return 0; /* partial frame; nothing more queued */
+        kh_apply_event(&ev);
+    }
+}
+
+/*
+ * Run the combo hold-gate state machine once per loop iteration.
+ *
+ * combo_bits  Bitmask with a bit per required key, all set.
+ *
+ * The hotkey fires (toggling crosshair visibility) once the full combo has
+ * been held for KROSSHAIR_HOTKEY_HOLD_MS; releasing any key before that
+ * cancels the hold. Runs on every iteration (event and tick paths) so the
+ * hold is evaluated even while held keys emit no new events.
+ */
+static void kh_update_combo(int combo_bits)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long held_ms = kh_elapsed_ms(&kh_combo_down_ts, &now);
+    if ((kh_keys_down & combo_bits) == combo_bits) {
+        if (!kh_combo_active) {
+            kh_combo_active = 1;
+            kh_combo_fired = 0;
+            kh_combo_down_ts = now;
+        } else if (!kh_combo_fired && held_ms >= KROSSHAIR_HOTKEY_HOLD_MS) {
+            crosshair_visible ^= 1;
+            kh_combo_fired = 1;
+            fprintf(stderr, "[KH] Hotkey %s pressed - crosshair will be %s\n",
+                    kh_hotkey_display, crosshair_visible ? "shown" : "hidden");
+            KROSSHAIR_LOG("[KROSSHAIR] hotkey fired -> crosshair %s\n",
+                          crosshair_visible ? "ON" : "OFF");
+        }
+    } else {
+        kh_combo_active = 0;
+        kh_combo_fired = 0;
+    }
+}
+
+/*
+ * Add all open input devices to a select() set.
+ *
+ * ready_set  The fd_set to fill.
+ *
+ * Returns the highest file descriptor, for select's nfds argument.
+ */
+static int kh_build_fd_set(fd_set* ready_set)
+{
+    FD_ZERO(ready_set);
+    int maxfd = 0;
+    for (int i = 0; i < kh_input_fd_count; ++i) {
+        FD_SET(kh_input_fds[i], ready_set);
+        if (kh_input_fds[i] > maxfd)
+            maxfd = kh_input_fds[i];
+    }
+    return maxfd;
+}
+
+/*
+ * Background thread body.
+ *
+ * Loops on select() over the open evdev devices. On a ready fd it drains
+ * and applies events; on a timeout it rescans /dev/input (100 ms tick,
+ * catches new / Proton virtual keyboards) and re-syncs the key bitmask
+ * from the kernel. After either path it evaluates the combo hold-gate.
+ */
 static void* input_thread_main(void* arg)
 {
     (void)arg;
-    int opened = scan_devices();
-    if (opened == 0) {
+    int device_count = scan_devices();
+    if (device_count == 0) {
         KROSSHAIR_LOG("[KROSSHAIR] no EV_KEY input devices; hotkey disabled\n");
         return NULL;
     }
 
-    struct timespec kh_t0;
-    clock_gettime(CLOCK_MONOTONIC, &kh_t0);
     fprintf(stderr, "[KH] Krosshair loaded. Hotkey to toggle: '%s' (change via env var 'KROSSHAIR_HOTKEY_TOGGLE').\n", kh_hotkey_display);
 
-    int need_bits = (1 << kh_required_key_count) - 1;
+    /* bitmask with one bit per required key, all set */
+    int combo_bits = (1 << kh_required_key_count) - 1;
 
     for (;;) {
-        fd_set set;
-        FD_ZERO(&set);
-        int maxfd = 0;
-        for (int i = 0; i < kh_input_fd_count; ++i) {
-            FD_SET(kh_input_fds[i], &set);
-            if (kh_input_fds[i] > maxfd)
-                maxfd = kh_input_fds[i];
-        }
+        fd_set ready_set;
+        int maxfd = kh_build_fd_set(&ready_set);
 
-        /* Dynamic timeout: default 100 ms rescan tick. While the combo is held
-         * and not yet fired, wake exactly at the hold boundary even though held
-         * keys emit no new events. No busy-wait. */
+        long timeout_ms = kh_select_timeout_ms();
         struct timeval tv;
-        long timeout_ms = 100;
-        if (kh_combo_active && !kh_combo_fired) {
-            struct timespec t;
-            clock_gettime(CLOCK_MONOTONIC, &t);
-            long held_ms = (t.tv_sec - kh_combo_down_ts.tv_sec) * 1000 +
-                           (t.tv_nsec - kh_combo_down_ts.tv_nsec) / 1000000;
-            long remain = KROSSHAIR_HOTKEY_HOLD_MS - held_ms;
-            if (remain < 0)
-                remain = 0;
-            timeout_ms = remain < 100 ? remain : 100;
-        }
         tv.tv_sec = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000; /* 100 ms default: timeout doubles as rescan tick */
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
 
-        int r = select(maxfd + 1, &set, NULL, NULL, &tv);
-        if (r <= 0) {
+        int ready = select(maxfd + 1, &ready_set, NULL, NULL, &tv);
+        if (ready <= 0) {
             /* Only rescan on the full 100 ms tick (catches new / Proton
              * virtual keyboards). The short dynamic hold-timeout just needs
              * a lightweight state re-check; a full device reopen is slow in
              * the flatpak sandbox and defeats the 25 ms wake. */
-            if (timeout_ms >= 100)
+            if (timeout_ms >= KROSSHAIR_RESYNC_TICK_MS)
                 scan_devices();
             kh_resync_state(); /* self-heal: snap bitmask to kernel reality */
         } else {
             for (int i = 0; i < kh_input_fd_count; ++i) {
                 int fd = kh_input_fds[i];
-                if (!FD_ISSET(fd, &set))
+                if (!FD_ISSET(fd, &ready_set))
                     continue;
-                int gone = 0;
-                for (;;) {
-                    struct input_event ev;
-                    ssize_t n = read(fd, &ev, sizeof(ev));
-                    if (n < 0) {
-                        if (errno == EAGAIN || errno == EINTR)
-                            break; /* buffer drained */
-                        close(fd);
-                        gone = 1;
-                        break;
-                    }
-                    if (n == 0) { /* EOF: device vanished */
-                        close(fd);
-                        gone = 1;
-                        break;
-                    }
-                    if (n < (ssize_t)sizeof(ev))
-                        break; /* partial frame; nothing more queued */
-                    kh_apply_event(&ev);
-                }
-                if (gone) {
+                if (kh_drain_device(fd)) {
                     kh_input_fds[i] = kh_input_fds[kh_input_fd_count - 1];
                     kh_input_fd_count--;
                     break;
@@ -262,36 +358,12 @@ static void* input_thread_main(void* arg)
             }
         }
 
-        /* Combo hold-gate: run on EVERY iteration (event and tick paths) so the
-         * hold is evaluated even while held keys emit no new events. Toggles once
-         * after a short hold; releasing before that cancels. */
-        {
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            long held_ms = (now.tv_sec - kh_combo_down_ts.tv_sec) * 1000 +
-                           (now.tv_nsec - kh_combo_down_ts.tv_nsec) / 1000000;
-            if ((kh_keys_down & need_bits) == need_bits) {
-                if (!kh_combo_active) {
-                    kh_combo_active = 1;
-                    kh_combo_fired = 0;
-                    kh_combo_down_ts = now;
-                } else if (!kh_combo_fired && held_ms >= KROSSHAIR_HOTKEY_HOLD_MS) {
-                    crosshair_visible ^= 1;
-                    kh_combo_fired = 1;
-                    fprintf(stderr, "[KH] Hotkey %s pressed - crosshair will be %s\n",
-                            kh_hotkey_display, crosshair_visible ? "shown" : "hidden");
-                    KROSSHAIR_LOG("[KROSSHAIR] hotkey fired -> crosshair %s\n",
-                                  crosshair_visible ? "ON" : "OFF");
-                }
-            } else {
-                kh_combo_active = 0;
-                kh_combo_fired = 0;
-            }
-        }
+        kh_update_combo(combo_bits);
     }
     return NULL;
 }
 
+/* One-shot init: parse the hotkey, then spawn the detached input thread. */
 static void kh_input_init_once(void)
 {
     parse_hotkey();
@@ -303,7 +375,10 @@ static void kh_input_init_once(void)
     pthread_detach(th);
 }
 
-
+/*
+ * Public entry point; safe to call from multiple threads.
+ * Runs kh_input_init_once exactly once.
+ */
 void init_input_thread(void)
 {
 	pthread_once(&kh_input_once, kh_input_init_once);
