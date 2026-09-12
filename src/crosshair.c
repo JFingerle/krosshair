@@ -24,6 +24,18 @@
 #include "../include/default_crosshair.h"
 #include "../include/krosshair.h"
 
+/*
+ * Parse a crosshair-maker dynamic .cfg file into shader push
+ * constants, starting from safe defaults.
+ *
+ * path:  path to the .cfg file; NULL or a missing file simply leaves
+ *        the defaults (all effects off, identity colors, opacity 1.0).
+ * pc:    push-constants struct written in place. quad_ndc_min/size are
+ *        not touched — the caller sets those from the canvas geometry.
+ *
+ * Each line is "name a1 [a2 a3 a4]"; unknown names, short lines, and
+ * '#' comments are ignored.
+ */
 static void parse_dynamic_cfg(const char* path, struct dynamic_push_constants* pc)
 {
         /* zero everything except quad_ndc_min/size (caller sets those) */
@@ -84,9 +96,18 @@ static void parse_dynamic_cfg(const char* path, struct dynamic_push_constants* p
 
 
 /*
- * Set up the quad vertices for rendering.
- *   uv_top / uv_bottom: vertical UV range (0..1 for full texture,
- *   or a sub-range for atlas frame selection)
+ * Fill a centered quad (4 vertices, two triangles via indices[]) for
+ * drawing a texture scaled to NDC, selecting the vertical UV slice
+ * [uv_top, uv_bottom].
+ *
+ * vertices:       4 vertex_t slots, filled in place;
+ * canvas_width/canvas_height: app (swapchain) size in pixels — the
+ *               reference the texture size is scaled against;
+ * tex_width/tex_height: crosshair texture size in pixels;
+ * scale:            uniform scale factor (1.0 = native size);
+ * uv_top/uv_bottom: top/bottom UV of the quad — 0..1 for a full
+ *               texture, a sub-range to pick one frame row of an
+ *               atlas.
  */
 void setup_vertices_uv(vertex_t* vertices,
                                float canvas_width, float canvas_height,
@@ -116,9 +137,14 @@ void setup_vertices_uv(vertex_t* vertices,
         vertices[3].tex_pos = (vec2_t){0.0f, uv_bottom};
 }
 
+/*
+ * setup_vertices_uv for the full texture (uv 0..1) — used for static
+ * (non-atlas) crosshairs. Same parameters as setup_vertices_uv minus
+ * the UV range.
+ */
 static void setup_vertices(vertex_t* vertices,
-                           float canvas_width, float canvas_height,
-                           float tex_width, float tex_height, float scale)
+                            float canvas_width, float canvas_height,
+                            float tex_width, float tex_height, float scale)
 {
         setup_vertices_uv(vertices, canvas_width, canvas_height, tex_width,
                           tex_height, scale, 0.0f, 1.0f);
@@ -126,6 +152,14 @@ static void setup_vertices(vertex_t* vertices,
 
 uint16_t indices[] = {0, 1, 2, 2, 3, 0};
 
+/*
+ * Expand a user-provided image path: a leading '~' is replaced by
+ * $HOME (so both "~" and "~/crosshair.png" work); any other path is
+ * returned unchanged.
+ *
+ * path: path from $KROSSHAIR_IMG (must be non-NULL).
+ * Returns a malloc'd copy (caller frees), or NULL if HOME is unset.
+ */
 static char* get_crosshair_file(const char* path)
 {
         if (!path) return NULL;
@@ -148,6 +182,13 @@ static char* get_crosshair_file(const char* path)
         return expanded_str;
 }
 
+/*
+ * Fetch a file's modification time.
+ *
+ * path:  file path;
+ * mtime: set to the file's mtime on success.
+ * Returns 0 on success, -1 if stat() fails (e.g. file missing).
+ */
 static int get_file_mtime(const char* path, struct timespec* mtime)
 {
         struct stat st;
@@ -156,9 +197,17 @@ static int get_file_mtime(const char* path, struct timespec* mtime)
         return 0;
 }
 
-// malloc's returned string, free later
-// returns crosshair-maker default if installed and no explicit KROSSHAIR_IMG set
-// tries current.apng first, then current.gif, then current.png
+/*
+ * Resolve the crosshair image path for this session.
+ *
+ * Priority: $KROSSHAIR_IMG (expanded via get_crosshair_file), else the
+ * crosshair-maker project dir (~/.config/crosshair-maker/projects/)
+ * where current.apng, then current.gif, then current.png is tried in
+ * order — animated formats first, first existing file wins.
+ *
+ * Returns a malloc'd path (caller frees), or NULL if no source exists
+ * (caller then falls back to the built-in crosshair).
+ */
 static char* get_crosshair_path(void)
 {
         const char* explicit = getenv("KROSSHAIR_IMG");
@@ -191,8 +240,13 @@ static char* get_crosshair_path(void)
         return NULL;
 }
 
-// malloc's returned string, free later
-// returns the path to {stem}.dynamic.png, or NULL if absent
+/*
+ * Path of the crosshair-maker dynamic mask
+ * (~/.config/crosshair-maker/projects/current.dynamic.png).
+ *
+ * Returns a malloc'd path (caller frees), or NULL if the file does not
+ * exist or HOME is unset.
+ */
 static char* get_dynamic_mask_path(void)
 {
         const char* home = getenv("HOME");
@@ -210,8 +264,13 @@ static char* get_dynamic_mask_path(void)
         return NULL;
 }
 
-// malloc's returned string, free later
-// returns the path to {stem}.dynamic.cfg, or NULL if absent
+/*
+ * Path of the crosshair-maker dynamic effect config
+ * (~/.config/crosshair-maker/projects/current.dynamic.cfg).
+ *
+ * Returns a malloc'd path (caller frees), or NULL if the file does not
+ * exist or HOME is unset.
+ */
 static char* get_dynamic_cfg_path(void)
 {
         const char* home = getenv("HOME");
@@ -232,6 +291,19 @@ static char* get_dynamic_cfg_path(void)
 /* ───────────────────── APNG loader ───────────────────── */
 
 
+/*
+ * Make sure this swapchain has an up-to-date crosshair image uploaded.
+ *
+ * If no image is uploaded yet (or one needs reloading because the path
+ * or mtime of the file changed), it loads the crosshair (GIF, APNG or
+ * PNG — animated sources become a vertical frame atlas), creates the
+ * GPU image/view/descriptor set, encodes the pixel upload into
+ * cmd_buffer, and builds the draw vertices. A missing or unreadable
+ * file falls back to the built-in crosshair.
+ *
+ * data:        swapchain to keep the crosshair of;
+ * cmd_buffer:  command buffer the pixel upload is encoded into.
+ */
 void ensure_swapchain_crosshair(swapchain_data_t* data,
                                         VkCommandBuffer cmd_buffer)
 {
@@ -565,8 +637,14 @@ void ensure_swapchain_crosshair(swapchain_data_t* data,
 }
 
 /*
- * Load the single dynamic mask + parse the config file.
- * Both are optional — if no mask file exists, nothing happens.
+ * Keep the dynamic mask and its .cfg push constants current for this
+ * swapchain: reload the mask when the file changed (or was deleted),
+ * encode a fresh upload into cmd_buffer, and re-parse the .cfg when
+ * its mtime changes (or it appears / is removed). Both the mask and
+ * the config are optional — if neither exists, nothing happens.
+ *
+ * data:        swapchain to keep the mask of;
+ * cmd_buffer:  command buffer the mask upload is encoded into.
  */
 void ensure_swapchain_dynamic_mask(swapchain_data_t* data,
                                           VkCommandBuffer cmd_buffer)
@@ -708,6 +786,10 @@ check_cfg:
  * timeout the frame is skipped instead of destroying a slot while its
  * submit is still in flight.  Each slot has its own cmd buffer (never
  * shared across slots), allocated from the device-scoped cmd_pool.
+ *
+ * data: swapchain the slot belongs to (also stored in
+ *       data->draws[slot]);
+ * slot: slot index (one slot per swapchain image).
  */
 krosshair_draw_t* create_draw_slot(swapchain_data_t* data, uint32_t slot)
 {
@@ -743,6 +825,15 @@ krosshair_draw_t* create_draw_slot(swapchain_data_t* data, uint32_t slot)
         return draw;
 }
 
+/*
+ * Tear down everything a draw ring slot owns: vertex/index buffers and
+ * their memory, both semaphores, the fence, and the slot's command
+ * buffer. Called from destroy_swapchain_data, which has already put
+ * the device idle so no submit can still reference these.
+ *
+ * data: swapchain the slot belongs to (device data comes from it);
+ * draw: slot to destroy; NULL is a no-op.
+ */
 void destroy_draw(swapchain_data_t* data, krosshair_draw_t* draw)
 {
         if (!draw) return;
