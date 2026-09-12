@@ -15,276 +15,363 @@
 
 #include "../include/krosshair.h"
 
-krosshair_draw_t* render_swapchain_display(
-    swapchain_data_t* data, queue_data_t* present_queue,
-    const VkSemaphore* wait_semaphores, unsigned n_wait_semaphores,
-    unsigned image_index)
+/*
+ * Wait for this draw slot's previous GPU submission to finish so its
+ * command buffer can be safely re-recorded.
+ *
+ * device_data    The device (vtable + handles).
+ * draw           The per-swapchain-image draw slot.
+ * image_index    Which image (for logging only).
+ *
+ * Returns 1 if the slot is ready to record; 0 if the previous submit did
+ * not finish within 100 ms (the caller should skip this frame — a slot
+ * must never be destroyed while its submit is in flight).
+ */
+static int wait_draw_slot_ready(device_data_t* device_data,
+                                krosshair_draw_t* draw, unsigned image_index)
 {
-        if (!crosshair_visible)
-                return NULL;
+        if (!draw->fence_submitted)
+                return 1;
 
+        VkResult wait_result = device_data->vtable.WaitForFences(
+            device_data->device, 1, &draw->fence, VK_TRUE, 100000000);
+        if (wait_result != VK_SUCCESS) {
+                KROSSHAIR_LOG("[KROSSHAIR] slot %u fence timeout, skipping frame\n",
+                               image_index);
+                return 0;
+        }
+        VK_CHECK(device_data->vtable.ResetFences(
+            device_data->device, 1, &draw->fence));
+        draw->fence_submitted = 0;
+        return 1;
+}
+
+/*
+ * Create (or recreate after a resolution change) the full-screen
+ * "game framebuffer" copy texture. Shader-based effects sample this
+ * texture to see the game frame underneath the crosshair.
+ *
+ * data  The swapchain state holding the texture handles (destroyed and
+ *       rebuilt here if missing or sized for a different resolution).
+ */
+static void ensure_game_fb_copy(swapchain_data_t* data)
+{
         device_data_t* device_data = data->device_data;
 
-        krosshair_draw_t* draw = data->draws[image_index];
-        if (!draw) {
-                KROSSHAIR_LOG("[KROSSHAIR] no draw slot for image %u\n", image_index);
-                return NULL;
+        if (data->game_fb_image &&
+            data->game_fb_width == data->width &&
+            data->game_fb_height == data->height)
+                return;
+
+        if (data->game_fb_image_view) {
+                device_data->vtable.DestroyImageView(
+                    device_data->device, data->game_fb_image_view, NULL);
+                data->game_fb_image_view = VK_NULL_HANDLE;
+        }
+        if (data->game_fb_image) {
+                device_data->vtable.DestroyImage(
+                    device_data->device, data->game_fb_image, NULL);
+                data->game_fb_image = VK_NULL_HANDLE;
+        }
+        if (data->game_fb_mem) {
+                device_data->vtable.FreeMemory(
+                    device_data->device, data->game_fb_mem, NULL);
+                data->game_fb_mem = VK_NULL_HANDLE;
         }
 
-        /* Slot reuse: wait for this slot's previous submit to complete
-         * before re-recording its command buffer.  If it does not complete
-         * in time, skip this frame (presented without the overlay
-         * semaphore) — never destroy a slot while its submit is in flight. */
-        if (draw->fence_submitted) {
-                VkResult wait_result = device_data->vtable.WaitForFences(
-                    device_data->device, 1, &draw->fence, VK_TRUE, 100000000);
-                if (wait_result != VK_SUCCESS) {
-                        KROSSHAIR_LOG("[KROSSHAIR] slot %u fence timeout, skipping frame\n",
-                                       image_index);
-                        return NULL;
+        VkImageCreateInfo image_info = {};
+        image_info.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        image_info.imageType     = VK_IMAGE_TYPE_2D;
+        image_info.format        = data->format;
+        image_info.extent.width  = data->width;
+        image_info.extent.height = data->height;
+        image_info.extent.depth  = 1;
+        image_info.mipLevels     = 1;
+        image_info.arrayLayers   = 1;
+        image_info.samples       = VK_SAMPLE_COUNT_1_BIT;
+        image_info.tiling        = VK_IMAGE_TILING_OPTIMAL;
+        image_info.usage         = VK_IMAGE_USAGE_SAMPLED_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        image_info.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+        image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VK_CHECK(device_data->vtable.CreateImage(
+            device_data->device, &image_info, NULL, &data->game_fb_image));
+
+        VkMemoryRequirements mem_req;
+        device_data->vtable.GetImageMemoryRequirements(
+            device_data->device, data->game_fb_image, &mem_req);
+
+        VkMemoryAllocateInfo alloc_info = {};
+        alloc_info.sType          = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        alloc_info.allocationSize = mem_req.size;
+        alloc_info.memoryTypeIndex =
+            vk_memory_type(device_data,
+                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                           mem_req.memoryTypeBits);
+        VK_CHECK(device_data->vtable.AllocateMemory(
+            device_data->device, &alloc_info, NULL, &data->game_fb_mem));
+        VK_CHECK(device_data->vtable.BindImageMemory(
+            device_data->device, data->game_fb_image,
+            data->game_fb_mem, 0));
+
+        VkImageViewCreateInfo view_info = {};
+        view_info.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        view_info.image    = data->game_fb_image;
+        view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view_info.format   = data->format;
+        view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        view_info.subresourceRange.levelCount = 1;
+        view_info.subresourceRange.layerCount = 1;
+        VK_CHECK(device_data->vtable.CreateImageView(
+            device_data->device, &view_info, NULL,
+            &data->game_fb_image_view));
+
+        data->game_fb_width  = data->width;
+        data->game_fb_height = data->height;
+
+        KROSSHAIR_LOG("[KROSSHAIR] created game FB copy texture %ux%u\n",
+                      data->width, data->height);
+}
+
+/*
+ * Record barriers and a full-image copy from the swapchain image into
+ * the game_fb copy texture, so shader-based effects can sample the game
+ * frame. Also transfers ownership of the swapchain image from the
+ * present queue family to the graphics queue family.
+ *
+ * data           Swapchain state (image handles, dimensions).
+ * cmd_buffer     Command buffer to record into.
+ * image_index    Which swapchain image to copy.
+ * present_queue  Queue the image was last presented on (source family).
+ */
+static void record_framebuffer_copy(swapchain_data_t* data,
+                                    VkCommandBuffer cmd_buffer,
+                                    unsigned image_index,
+                                    queue_data_t* present_queue)
+{
+        device_data_t* device_data = data->device_data;
+
+        /* swapchain image: PRESENT_SRC -> TRANSFER_SRC (so we can read it) */
+        VkImageMemoryBarrier swapchain_barrier = {};
+        swapchain_barrier.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        swapchain_barrier.image         = data->images[image_index];
+        swapchain_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        swapchain_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        swapchain_barrier.oldLayout     = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        swapchain_barrier.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        swapchain_barrier.srcQueueFamilyIndex = present_queue->family_index;
+        swapchain_barrier.dstQueueFamilyIndex = device_data->graphic_queue->family_index;
+        swapchain_barrier.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+        swapchain_barrier.subresourceRange.baseMipLevel   = 0;
+        swapchain_barrier.subresourceRange.levelCount     = 1;
+        swapchain_barrier.subresourceRange.baseArrayLayer = 0;
+        swapchain_barrier.subresourceRange.layerCount     = 1;
+        device_data->vtable.CmdPipelineBarrier(
+            cmd_buffer, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
+            &swapchain_barrier);
+
+        /* game_fb copy: UNDEFINED -> TRANSFER_DST (so we can write it) */
+        VkImageMemoryBarrier fb_barrier = {};
+        fb_barrier.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        fb_barrier.image         = data->game_fb_image;
+        fb_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        fb_barrier.oldLayout     = VK_IMAGE_LAYOUT_UNDEFINED;
+        fb_barrier.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        fb_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        fb_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        fb_barrier.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+        fb_barrier.subresourceRange.baseMipLevel   = 0;
+        fb_barrier.subresourceRange.levelCount     = 1;
+        fb_barrier.subresourceRange.baseArrayLayer = 0;
+        fb_barrier.subresourceRange.layerCount     = 1;
+        device_data->vtable.CmdPipelineBarrier(
+            cmd_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
+            &fb_barrier);
+
+        /* copy swapchain -> game_fb */
+        VkImageCopy copy_region = {};
+        copy_region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy_region.srcSubresource.layerCount = 1;
+        copy_region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy_region.dstSubresource.layerCount = 1;
+        copy_region.extent.width  = data->width;
+        copy_region.extent.height = data->height;
+        copy_region.extent.depth  = 1;
+        device_data->vtable.CmdCopyImage(
+            cmd_buffer,
+            data->images[image_index], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            data->game_fb_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1, &copy_region);
+
+        /* game_fb copy: TRANSFER_DST -> SHADER_READ_ONLY (so the shader can sample it) */
+        fb_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        fb_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        fb_barrier.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        fb_barrier.newLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        device_data->vtable.CmdPipelineBarrier(
+            cmd_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0, 0, NULL, 0, NULL, 1, &fb_barrier);
+
+        /* swapchain image: TRANSFER_SRC -> COLOR_ATTACHMENT (so the render pass works) */
+        swapchain_barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        swapchain_barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        swapchain_barrier.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        swapchain_barrier.newLayout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        device_data->vtable.CmdPipelineBarrier(
+            cmd_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            0, 0, NULL, 0, NULL, 1, &swapchain_barrier);
+}
+
+/*
+ * Simple layout transition for the no-copy path: move the swapchain
+ * image from PRESENT_SRC_KHR to COLOR_ATTACHMENT_OPTIMAL so the render
+ * pass can write the crosshair into it (and hand ownership to the
+ * graphics queue family).
+ *
+ * data           Swapchain state.
+ * cmd_buffer     Command buffer to record into.
+ * image_index    Which swapchain image to transition.
+ * present_queue  Queue the image was last presented on (source family).
+ */
+static void transition_swapchain_for_render(swapchain_data_t* data,
+                                            VkCommandBuffer cmd_buffer,
+                                            unsigned image_index,
+                                            queue_data_t* present_queue)
+{
+        device_data_t* device_data = data->device_data;
+
+        VkImageMemoryBarrier swapchain_barrier = {};
+        swapchain_barrier.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        swapchain_barrier.image         = data->images[image_index];
+        swapchain_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        swapchain_barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        swapchain_barrier.oldLayout     = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        swapchain_barrier.newLayout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        swapchain_barrier.srcQueueFamilyIndex = present_queue->family_index;
+        swapchain_barrier.dstQueueFamilyIndex = device_data->graphic_queue->family_index;
+        swapchain_barrier.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+        swapchain_barrier.subresourceRange.baseMipLevel   = 0;
+        swapchain_barrier.subresourceRange.levelCount     = 1;
+        swapchain_barrier.subresourceRange.baseArrayLayer = 0;
+        swapchain_barrier.subresourceRange.layerCount     = 1;
+        device_data->vtable.CmdPipelineBarrier(
+            cmd_buffer, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+            VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 0, NULL, 0, NULL, 1,
+            &swapchain_barrier);
+}
+
+/*
+ * Advance the animated crosshair (GIF/APNG) to the frame that should be
+ * shown right now, and recompute the quad's UV coordinates to point at
+ * that frame's strip in the atlas texture.
+ *
+ * The frame clock accumulates elapsed time (rather than resetting to
+ * "now") so leftover time carries over and the animation stays in sync
+ * when the present rate is lower than the animation rate.
+ *
+ * data  Swapchain state holding the animation frame index, per-frame
+ *      delays and the quad vertex buffer (rewritten here).
+ * draw  The draw slot being recorded (flagged dirty so the updated
+ *      vertex buffer is re-uploaded).
+ */
+static void advance_anim_frame(swapchain_data_t* data, krosshair_draw_t* draw)
+{
+        if (data->anim_frame_count <= 1 || !data->anim_delays)
+                return;
+
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+
+        long elapsed_ms =
+            (now.tv_sec - data->anim_last_frame_time.tv_sec) * 1000 +
+            (now.tv_nsec - data->anim_last_frame_time.tv_nsec) / 1000000;
+
+        int frame_advanced = 0;
+        int delay_ms = data->anim_delays[data->anim_current_frame];
+
+        /* consume all elapsed time, advancing multiple frames if
+         * the present rate is lower than the animation rate */
+        while (elapsed_ms >= delay_ms) {
+                /* accumulate: add delay to last_frame_time instead
+                 * of resetting to now, so leftover time carries
+                 * over and the animation stays in sync */
+                data->anim_last_frame_time.tv_nsec += (long)delay_ms * 1000000L;
+                while (data->anim_last_frame_time.tv_nsec >= 1000000000L) {
+                        data->anim_last_frame_time.tv_sec++;
+                        data->anim_last_frame_time.tv_nsec -= 1000000000L;
                 }
-                VK_CHECK(device_data->vtable.ResetFences(
-                    device_data->device, 1, &draw->fence));
-                draw->fence_submitted = 0;
-        }
-        device_data->vtable.ResetCommandBuffer(draw->cmd_buffer, 0);
 
-        VkRenderPassBeginInfo render_pass_info = {};
-        render_pass_info.sType       = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        render_pass_info.renderPass  = data->device_data->render_pass;
-        render_pass_info.framebuffer = data->framebuffers[image_index];
-        render_pass_info.renderArea.extent.width   = data->width;
-        render_pass_info.renderArea.extent.height  = data->height;
+                data->anim_current_frame =
+                    (data->anim_current_frame + 1) % data->anim_frame_count;
+                delay_ms = data->anim_delays[data->anim_current_frame];
+                frame_advanced = 1;
 
-        VkCommandBufferBeginInfo buffer_begin_info = {};
-        buffer_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-
-        device_data->vtable.BeginCommandBuffer(draw->cmd_buffer,
-                                               &buffer_begin_info);
-        ensure_swapchain_crosshair(data, draw->cmd_buffer);
-        ensure_swapchain_dynamic_mask(data, draw->cmd_buffer);
-
-        /* FB copy needed whenever the dynamic mask is active */
-        int needs_fb_copy = data->dynamic_mask.uploaded;
-
-        VkImageMemoryBarrier imb = {};
-        imb.sType                = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        imb.pNext                = NULL;
-        imb.image                = data->images[image_index];
-        imb.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
-        imb.subresourceRange.baseMipLevel   = 0;
-        imb.subresourceRange.levelCount     = 1;
-        imb.subresourceRange.baseArrayLayer = 0;
-        imb.subresourceRange.layerCount     = 1;
-        imb.srcQueueFamilyIndex             = present_queue->family_index;
-        imb.dstQueueFamilyIndex = device_data->graphic_queue->family_index;
-
-        if (needs_fb_copy) {
-                /* ── copy game framebuffer for shader-based modes ──
-                 * 1) PRESENT_SRC → TRANSFER_SRC  (so we can read)
-                 * 2) blit full swapchain to game_fb_image
-                 * 3) TRANSFER_SRC → COLOR_ATTACHMENT (so render pass works)
-                 */
-
-                /* ensure game_fb texture exists at swapchain resolution */
-                if (!data->game_fb_image ||
-                    data->game_fb_width != data->width ||
-                    data->game_fb_height != data->height) {
-                        if (data->game_fb_image_view) {
-                                device_data->vtable.DestroyImageView(
-                                    device_data->device, data->game_fb_image_view, NULL);
-                                data->game_fb_image_view = VK_NULL_HANDLE;
-                        }
-                        if (data->game_fb_image) {
-                                device_data->vtable.DestroyImage(
-                                    device_data->device, data->game_fb_image, NULL);
-                                data->game_fb_image = VK_NULL_HANDLE;
-                        }
-                        if (data->game_fb_mem) {
-                                device_data->vtable.FreeMemory(
-                                    device_data->device, data->game_fb_mem, NULL);
-                                data->game_fb_mem = VK_NULL_HANDLE;
-                        }
-
-                        VkImageCreateInfo fbi = {};
-                        fbi.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-                        fbi.imageType     = VK_IMAGE_TYPE_2D;
-                        fbi.format        = data->format;
-                        fbi.extent.width  = data->width;
-                        fbi.extent.height = data->height;
-                        fbi.extent.depth  = 1;
-                        fbi.mipLevels     = 1;
-                        fbi.arrayLayers   = 1;
-                        fbi.samples       = VK_SAMPLE_COUNT_1_BIT;
-                        fbi.tiling        = VK_IMAGE_TILING_OPTIMAL;
-                        fbi.usage         = VK_IMAGE_USAGE_SAMPLED_BIT |
-                                            VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-                        fbi.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
-                        fbi.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-                        VK_CHECK(device_data->vtable.CreateImage(
-                            device_data->device, &fbi, NULL, &data->game_fb_image));
-
-                        VkMemoryRequirements mreq;
-                        device_data->vtable.GetImageMemoryRequirements(
-                            device_data->device, data->game_fb_image, &mreq);
-
-                        VkMemoryAllocateInfo mai = {};
-                        mai.sType          = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-                        mai.allocationSize = mreq.size;
-                        mai.memoryTypeIndex =
-                            vk_memory_type(device_data,
-                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                                           mreq.memoryTypeBits);
-                        VK_CHECK(device_data->vtable.AllocateMemory(
-                            device_data->device, &mai, NULL, &data->game_fb_mem));
-                        VK_CHECK(device_data->vtable.BindImageMemory(
-                            device_data->device, data->game_fb_image,
-                            data->game_fb_mem, 0));
-
-                        VkImageViewCreateInfo fvi = {};
-                        fvi.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-                        fvi.image    = data->game_fb_image;
-                        fvi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-                        fvi.format   = data->format;
-                        fvi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                        fvi.subresourceRange.levelCount = 1;
-                        fvi.subresourceRange.layerCount = 1;
-                        VK_CHECK(device_data->vtable.CreateImageView(
-                            device_data->device, &fvi, NULL,
-                            &data->game_fb_image_view));
-
-                        data->game_fb_width  = data->width;
-                        data->game_fb_height = data->height;
-
-                        KROSSHAIR_LOG("[KROSSHAIR] created game FB copy texture %ux%u\n",
-                                      data->width, data->height);
-                }
-
-                /* transition swapchain: PRESENT_SRC → TRANSFER_SRC */
-                imb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                imb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                imb.oldLayout     = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-                imb.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                device_data->vtable.CmdPipelineBarrier(
-                    draw->cmd_buffer, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &imb);
-
-                /* transition game_fb: UNDEFINED → TRANSFER_DST */
-                VkImageMemoryBarrier fb_bar = {};
-                fb_bar.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-                fb_bar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                fb_bar.oldLayout     = VK_IMAGE_LAYOUT_UNDEFINED;
-                fb_bar.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                fb_bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                fb_bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                fb_bar.image         = data->game_fb_image;
-                fb_bar.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                fb_bar.subresourceRange.levelCount = 1;
-                fb_bar.subresourceRange.layerCount = 1;
-                device_data->vtable.CmdPipelineBarrier(
-                    draw->cmd_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &fb_bar);
-
-                /* copy swapchain → game_fb */
-                VkImageCopy region = {};
-                region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                region.srcSubresource.layerCount = 1;
-                region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                region.dstSubresource.layerCount = 1;
-                region.extent.width  = data->width;
-                region.extent.height = data->height;
-                region.extent.depth  = 1;
-                device_data->vtable.CmdCopyImage(
-                    draw->cmd_buffer,
-                    data->images[image_index], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    data->game_fb_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    1, &region);
-
-                /* transition game_fb: TRANSFER_DST → SHADER_READ_ONLY */
-                fb_bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                fb_bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                fb_bar.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                fb_bar.newLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                device_data->vtable.CmdPipelineBarrier(
-                    draw->cmd_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                    0, 0, NULL, 0, NULL, 1, &fb_bar);
-
-                /* transition swapchain: TRANSFER_SRC → COLOR_ATTACHMENT */
-                imb.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                imb.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                imb.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                imb.newLayout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                device_data->vtable.CmdPipelineBarrier(
-                    draw->cmd_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                    0, 0, NULL, 0, NULL, 1, &imb);
-        } else {
-                /* no FB copy needed — simple transition */
-                imb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                imb.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                imb.oldLayout     = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-                imb.newLayout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                device_data->vtable.CmdPipelineBarrier(
-                    draw->cmd_buffer, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
-                    VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
-                    0, 0, NULL, 0, NULL, 1, &imb);
-        }
-
-        device_data->vtable.CmdBeginRenderPass(
-            draw->cmd_buffer, &render_pass_info, VK_SUBPASS_CONTENTS_INLINE);
-
-        /* advance animation frame if needed (GIF or APNG) */
-        if (data->anim_frame_count > 1 && data->anim_delays) {
-                struct timespec now;
-                clock_gettime(CLOCK_MONOTONIC, &now);
-
-                long elapsed_ms =
+                /* recalculate elapsed from updated base */
+                elapsed_ms =
                     (now.tv_sec - data->anim_last_frame_time.tv_sec) * 1000 +
                     (now.tv_nsec - data->anim_last_frame_time.tv_nsec) / 1000000;
-
-                int advanced = 0;
-                int delay = data->anim_delays[data->anim_current_frame];
-
-                /* consume all elapsed time, advancing multiple frames if
-                 * the present rate is lower than the animation rate */
-                while (elapsed_ms >= delay) {
-                        /* accumulate: add delay to last_frame_time instead
-                         * of resetting to now, so leftover time carries
-                         * over and the animation stays in sync */
-                        data->anim_last_frame_time.tv_nsec += (long)delay * 1000000L;
-                        while (data->anim_last_frame_time.tv_nsec >= 1000000000L) {
-                                data->anim_last_frame_time.tv_sec++;
-                                data->anim_last_frame_time.tv_nsec -= 1000000000L;
-                        }
-
-                        data->anim_current_frame =
-                            (data->anim_current_frame + 1) % data->anim_frame_count;
-                        delay = data->anim_delays[data->anim_current_frame];
-                        advanced = 1;
-
-                        /* recalculate elapsed from updated base */
-                        elapsed_ms =
-                            (now.tv_sec - data->anim_last_frame_time.tv_sec) * 1000 +
-                            (now.tv_nsec - data->anim_last_frame_time.tv_nsec) / 1000000;
-                }
-
-                if (advanced) {
-                        float uv_step = 1.0f / (float)data->anim_frame_count;
-                        float uv_top  = uv_step * (float)data->anim_current_frame;
-                        float uv_bot  = uv_top + uv_step;
-                        setup_vertices_uv(
-                            data->vertices,
-                            (float)data->width, (float)data->height,
-                            (float)data->crosshair_tex_width,
-                            (float)data->anim_frame_height, 1.0f,
-                            uv_top, uv_bot);
-
-                        /* force vertex buffer re-upload with new UVs */
-                        draw->vertex_buffer_initialized = 0;
-                }
         }
 
+        if (frame_advanced) {
+                float uv_step = 1.0f / (float)data->anim_frame_count;
+                float uv_top  = uv_step * (float)data->anim_current_frame;
+                float uv_bot  = uv_top + uv_step;
+                setup_vertices_uv(
+                    data->vertices,
+                    (float)data->width, (float)data->height,
+                    (float)data->crosshair_tex_width,
+                    (float)data->anim_frame_height, 1.0f,
+                    uv_top, uv_bot);
+
+                /* force vertex buffer re-upload with new UVs */
+                draw->vertex_buffer_initialized = 0;
+        }
+}
+
+/*
+ * Copy `bytes` bytes of host data into a device memory block through a
+ * temporary CPU mapping (map, memcpy, flush, unmap).
+ *
+ * device_data   The device.
+ * memory        Device memory to write into.
+ * data          Host source.
+ * bytes         Number of bytes to copy.
+ */
+static void upload_device_memory(device_data_t* device_data,
+                                 VkDeviceMemory memory,
+                                 const void* data, size_t bytes)
+{
+        void* mapped = NULL;
+        VK_CHECK(device_data->vtable.MapMemory(
+            device_data->device, memory, 0, VK_WHOLE_SIZE, 0, &mapped));
+        memcpy(mapped, data, bytes);
+
+        VkMappedMemoryRange range = {};
+        range.sType  = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        range.memory = memory;
+        range.size   = VK_WHOLE_SIZE;
+        VK_CHECK(device_data->vtable.FlushMappedMemoryRanges(
+            device_data->device, 1, &range));
+        device_data->vtable.UnmapMemory(device_data->device, memory);
+}
+
+/*
+ * Make sure the draw slot's vertex and index buffers are large enough
+ * for this frame's quad, growing them (and marking them dirty for a
+ * re-upload) when needed.
+ *
+ * device_data   The device.
+ * data          Swapchain state (vertex array to upload).
+ * draw          The draw slot owning the GPU buffers.
+ */
+static void ensure_quad_buffers(device_data_t* device_data,
+                                swapchain_data_t* data,
+                                krosshair_draw_t* draw)
+{
         size_t vertex_size = sizeof(data->vertices);
         size_t index_size  = sizeof(indices);
         if (draw->vertex_buffer_size < vertex_size) {
@@ -303,218 +390,144 @@ krosshair_draw_t* render_swapchain_display(
         }
 
         if (!draw->vertex_buffer_initialized) {
-                void* vtx_dst = NULL;
-                VK_CHECK(device_data->vtable.MapMemory(
-                    device_data->device, draw->vertex_buffer_mem, 0,
-                    draw->vertex_buffer_size, 0, &vtx_dst));
-                memcpy(vtx_dst, data->vertices, sizeof(data->vertices));
-
-                VkMappedMemoryRange vtx_range = {};
-                vtx_range.sType               = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-                vtx_range.memory              = draw->vertex_buffer_mem;
-                vtx_range.size                = VK_WHOLE_SIZE;
-                VK_CHECK(device_data->vtable.FlushMappedMemoryRanges(
-                    device_data->device, 1, &vtx_range));
-                device_data->vtable.UnmapMemory(device_data->device,
-                                                draw->vertex_buffer_mem);
+                upload_device_memory(device_data, draw->vertex_buffer_mem,
+                                     data->vertices, sizeof(data->vertices));
                 draw->vertex_buffer_initialized = 1;
         }
-
         if (!draw->index_buffer_initialized) {
-                void* idx_dst = NULL;
-                VK_CHECK(device_data->vtable.MapMemory(
-                    device_data->device, draw->index_buffer_mem, 0,
-                    draw->index_buffer_size, 0, &idx_dst));
-                memcpy(idx_dst, indices, sizeof(indices));
-
-                VkMappedMemoryRange idx_range = {};
-                idx_range.sType               = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-                idx_range.memory              = draw->index_buffer_mem;
-                idx_range.size                = VK_WHOLE_SIZE;
-                VK_CHECK(device_data->vtable.FlushMappedMemoryRanges(
-                    device_data->device, 1, &idx_range));
-                device_data->vtable.UnmapMemory(device_data->device,
-                                                draw->index_buffer_mem);
+                upload_device_memory(device_data, draw->index_buffer_mem,
+                                     indices, sizeof(indices));
                 draw->index_buffer_initialized = 1;
         }
+}
+
+/*
+ * Record the optional second draw call: the shader-based dynamic effect
+ * mask that samples the game framebuffer copy (see record_framebuffer_copy).
+ * Only runs when the mask is uploaded, the shader pipeline exists and the
+ * framebuffer copy texture is available.
+ *
+ * data  Swapchain state (mask texture/vertices, descriptor set, push
+ *      constants).
+ * draw  The draw slot (second vertex buffer, command buffer).
+ */
+static void record_dynamic_mask_draw(swapchain_data_t* data,
+                                     krosshair_draw_t* draw)
+{
+        device_data_t* device_data = data->device_data;
+        if (!data->dynamic_mask.uploaded || !device_data->shader_pipeline ||
+            !data->game_fb_image_view)
+                return;
+
+        /* ensure the mask's own vertex buffer exists and is up to date */
+        size_t mask_vertex_size = sizeof(data->dynamic_mask.vertices);
+        if (draw->vertex_buffer2_size < mask_vertex_size) {
+                create_or_resize_buffer(device_data, &draw->vertex_buffer2,
+                                        &draw->vertex_buffer2_mem,
+                                        &draw->vertex_buffer2_size, mask_vertex_size,
+                                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        }
+        upload_device_memory(device_data, draw->vertex_buffer2_mem,
+                             data->dynamic_mask.vertices,
+                             sizeof(data->dynamic_mask.vertices));
 
         device_data->vtable.CmdBindPipeline(
             draw->cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-            data->device_data->pipeline);
+            device_data->shader_pipeline);
 
-        VkDeviceSize offsets[1] = {0};
-        device_data->vtable.CmdBindVertexBuffers(draw->cmd_buffer, 0, 1,
-                                                 &draw->vertex_buffer, offsets);
-        device_data->vtable.CmdBindIndexBuffer(
-            draw->cmd_buffer, draw->index_buffer, 0, VK_INDEX_TYPE_UINT16);
+        VkDeviceSize mask_offsets[1] = {0};
+        device_data->vtable.CmdBindVertexBuffers(
+            draw->cmd_buffer, 0, 1, &draw->vertex_buffer2, mask_offsets);
 
-        VkViewport viewport = {};
-        viewport.x          = 0;
-        viewport.y          = 0;
-        viewport.width      = data->width;
-        viewport.height     = data->height;
-        viewport.minDepth   = 0.0f;
-        viewport.maxDepth   = 1.0f;
-        device_data->vtable.CmdSetViewport(draw->cmd_buffer, 0, 1, &viewport);
+        /* allocate the descriptor set (mask texture + game FB copy) once */
+        if (!data->shader_mask_desc_set) {
+                VkDescriptorSetAllocateInfo alloc_info = {};
+                alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+                alloc_info.descriptorPool     = device_data->shader_desc_pool;
+                alloc_info.descriptorSetCount = 1;
+                alloc_info.pSetLayouts        = &device_data->shader_desc_layout;
+                VK_CHECK(device_data->vtable.AllocateDescriptorSets(
+                    device_data->device, &alloc_info,
+                    &data->shader_mask_desc_set));
 
-        VkRect2D scissor      = {};
-        scissor.offset.x      = 0;
-        scissor.offset.y      = 0;
-        scissor.extent.width  = data->width;
-        scissor.extent.height = data->height;
-        device_data->vtable.CmdSetScissor(draw->cmd_buffer, 0, 1, &scissor);
+                VkDescriptorImageInfo mask_image = {};
+                mask_image.sampler     = device_data->crosshair_sampler;
+                mask_image.imageView   = data->dynamic_mask.image_view;
+                mask_image.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+                VkDescriptorImageInfo fb_image = {};
+                fb_image.sampler     = device_data->crosshair_sampler;
+                fb_image.imageView   = data->game_fb_image_view;
+                fb_image.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+                VkWriteDescriptorSet writes[2] = {};
+                writes[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[0].dstSet          = data->shader_mask_desc_set;
+                writes[0].dstBinding      = 0;
+                writes[0].descriptorCount = 1;
+                writes[0].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                writes[0].pImageInfo      = &mask_image;
+                writes[1].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[1].dstSet          = data->shader_mask_desc_set;
+                writes[1].dstBinding      = 1;
+                writes[1].descriptorCount = 1;
+                writes[1].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                writes[1].pImageInfo      = &fb_image;
+                device_data->vtable.UpdateDescriptorSets(
+                    device_data->device, 2, writes, 0, NULL);
+        }
 
         device_data->vtable.CmdBindDescriptorSets(
             draw->cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-            data->device_data->pipeline_layout, 0, 1, &data->descriptor_set, 0,
-            NULL);
-        device_data->vtable.CmdDrawIndexed(draw->cmd_buffer,
-                                            sizeof(indices) / sizeof(indices[0]),
-                                            1, 0, 0, 0);
+            device_data->shader_pipeline_layout, 0, 1,
+            &data->shader_mask_desc_set, 0, NULL);
 
-        /* ── single dynamic effect mask draw (optional) ──
-         * Uses the shader pipeline that samples the game FB copy.
-         * Only runs if the dynamic mask is uploaded and the shader pipeline exists.
-         */
-        if (data->dynamic_mask.uploaded && data->device_data->shader_pipeline &&
-            data->game_fb_image_view) {
-                /* ensure vertex_buffer2 exists for dynamic mask */
-                size_t vtx2_size = sizeof(data->dynamic_mask.vertices);
-                if (draw->vertex_buffer2_size < vtx2_size) {
-                        create_or_resize_buffer(device_data, &draw->vertex_buffer2,
-                                                &draw->vertex_buffer2_mem,
-                                                &draw->vertex_buffer2_size, vtx2_size,
-                                                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-                }
+        /* fill the quad's NDC bounds into push constants (the shader fades
+         * the effect across the quad) */
+        data->dynamic_pc.quad_ndc_min[0]  = data->dynamic_mask.vertices[0].pos.x;
+        data->dynamic_pc.quad_ndc_min[1]  = data->dynamic_mask.vertices[0].pos.y;
+        data->dynamic_pc.quad_ndc_size[0] = data->dynamic_mask.vertices[2].pos.x -
+                                            data->dynamic_mask.vertices[0].pos.x;
+        data->dynamic_pc.quad_ndc_size[1] = data->dynamic_mask.vertices[2].pos.y -
+                                            data->dynamic_mask.vertices[0].pos.y;
 
-                /* upload dynamic mask vertices to separate buffer */
-                void* vtx_dst = NULL;
-                VK_CHECK(device_data->vtable.MapMemory(
-                    device_data->device, draw->vertex_buffer2_mem, 0,
-                    draw->vertex_buffer2_size, 0, &vtx_dst));
-                memcpy(vtx_dst, data->dynamic_mask.vertices,
-                       sizeof(data->dynamic_mask.vertices));
+        device_data->vtable.CmdPushConstants(
+            draw->cmd_buffer, device_data->shader_pipeline_layout,
+            VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+            sizeof(data->dynamic_pc), &data->dynamic_pc);
 
-                VkMappedMemoryRange vtx_range = {};
-                vtx_range.sType  = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-                vtx_range.memory = draw->vertex_buffer2_mem;
-                vtx_range.size   = VK_WHOLE_SIZE;
-                VK_CHECK(device_data->vtable.FlushMappedMemoryRanges(
-                    device_data->device, 1, &vtx_range));
-                device_data->vtable.UnmapMemory(device_data->device,
-                                                draw->vertex_buffer2_mem);
+        device_data->vtable.CmdDrawIndexed(
+            draw->cmd_buffer,
+            sizeof(indices) / sizeof(indices[0]),
+            1, 0, 0, 0);
+}
 
-                device_data->vtable.CmdBindPipeline(
-                    draw->cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                    data->device_data->shader_pipeline);
-
-                VkDeviceSize mask_offsets[1] = {0};
-                device_data->vtable.CmdBindVertexBuffers(
-                    draw->cmd_buffer, 0, 1, &draw->vertex_buffer2, mask_offsets);
-
-                /* allocate/update descriptor set for mask + game_fb if needed */
-                if (!data->shader_mask_desc_set) {
-                        VkDescriptorSetAllocateInfo dsai = {};
-                        dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-                        dsai.descriptorPool     = data->device_data->shader_desc_pool;
-                        dsai.descriptorSetCount = 1;
-                        dsai.pSetLayouts        = &data->device_data->shader_desc_layout;
-                        VK_CHECK(device_data->vtable.AllocateDescriptorSets(
-                            device_data->device, &dsai,
-                            &data->shader_mask_desc_set));
-
-                        VkDescriptorImageInfo di_mask = {};
-                        di_mask.sampler     = data->device_data->crosshair_sampler;
-                        di_mask.imageView   = data->dynamic_mask.image_view;
-                        di_mask.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-                        VkDescriptorImageInfo di_fb = {};
-                        di_fb.sampler     = data->device_data->crosshair_sampler;
-                        di_fb.imageView   = data->game_fb_image_view;
-                        di_fb.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-                        VkWriteDescriptorSet writes[2] = {};
-                        writes[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                        writes[0].dstSet          = data->shader_mask_desc_set;
-                        writes[0].dstBinding      = 0;
-                        writes[0].descriptorCount = 1;
-                        writes[0].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                        writes[0].pImageInfo      = &di_mask;
-                        writes[1].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                        writes[1].dstSet          = data->shader_mask_desc_set;
-                        writes[1].dstBinding      = 1;
-                        writes[1].descriptorCount = 1;
-                        writes[1].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                        writes[1].pImageInfo      = &di_fb;
-                        device_data->vtable.UpdateDescriptorSets(
-                            device_data->device, 2, writes, 0, NULL);
-                }
-
-                device_data->vtable.CmdBindDescriptorSets(
-                    draw->cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                    data->device_data->shader_pipeline_layout, 0, 1,
-                    &data->shader_mask_desc_set, 0, NULL);
-
-                /* fill quad NDC bounds into push constants */
-                data->dynamic_pc.quad_ndc_min[0]  = data->dynamic_mask.vertices[0].pos.x;
-                data->dynamic_pc.quad_ndc_min[1]  = data->dynamic_mask.vertices[0].pos.y;
-                data->dynamic_pc.quad_ndc_size[0] = data->dynamic_mask.vertices[2].pos.x -
-                                                    data->dynamic_mask.vertices[0].pos.x;
-                data->dynamic_pc.quad_ndc_size[1] = data->dynamic_mask.vertices[2].pos.y -
-                                                    data->dynamic_mask.vertices[0].pos.y;
-
-                device_data->vtable.CmdPushConstants(
-                    draw->cmd_buffer, data->device_data->shader_pipeline_layout,
-                    VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                    sizeof(data->dynamic_pc), &data->dynamic_pc);
-
-                device_data->vtable.CmdDrawIndexed(
-                    draw->cmd_buffer,
-                    sizeof(indices) / sizeof(indices[0]),
-                    1, 0, 0, 0);
-        }
-
-        device_data->vtable.CmdEndRenderPass(draw->cmd_buffer);
-
-        /*
-         * transfer the image back to the present queue family
-         * image layout was already changed to present by the render pass
-         */
-        if (device_data->graphic_queue->family_index !=
-            present_queue->family_index) {
-                imb.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-                imb.pNext         = NULL;
-                imb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                imb.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                imb.oldLayout     = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-                imb.newLayout     = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-                imb.image         = data->images[image_index];
-                imb.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
-                imb.subresourceRange.baseMipLevel   = 0;
-                imb.subresourceRange.levelCount     = 1;
-                imb.subresourceRange.baseArrayLayer = 0;
-                imb.subresourceRange.layerCount     = 1;
-                imb.srcQueueFamilyIndex =
-                    device_data->graphic_queue->family_index;
-                imb.dstQueueFamilyIndex = present_queue->family_index;
-                device_data->vtable.CmdPipelineBarrier(
-                    draw->cmd_buffer, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
-                    VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 0, NULL, 0, NULL, 1,
-                    &imb);
-        }
-
-        VkResult end_result = device_data->vtable.EndCommandBuffer(draw->cmd_buffer);
-        if (end_result != VK_SUCCESS) {
-                KROSSHAIR_LOG("[KROSSHAIR] EndCommandBuffer failed: %d\n", end_result);
-                return NULL;
-        }
-
-        /* when presenting on a different queue than where we're drawing the
-         * crosshair *AND* when the application does not provide a semaphore to
-         * vkQueuePresent, insert our own cross-engine synchronization
-         * semaphore.
-         * */
+/*
+ * Submit the recorded overlay command buffer to the GPU.
+ *
+ * If the present queue differs from the graphics queue and the app did not
+ * give us a wait semaphore, two submits are used with an intermediate
+ * semaphore (signal on the present queue, wait on the graphics queue) to
+ * synchronize the engines ourselves. Otherwise a single submit waits on
+ * the app's semaphores in the color-attachment stage.
+ *
+ * device_data         The device.
+ * draw                The draw slot (command buffer, semaphores, fence).
+ * present_queue       The queue the image will be presented on.
+ * wait_semaphores     App's wait semaphores for this swapchain image
+ *                     (may be NULL when n_wait_semaphores is 0).
+ * n_wait_semaphores   How many of them.
+ *
+ * Returns 0 on success, -1 on failure (the caller skips this frame).
+ */
+static int submit_overlay_draw(device_data_t* device_data,
+                               krosshair_draw_t* draw,
+                               queue_data_t* present_queue,
+                               const VkSemaphore* wait_semaphores,
+                               unsigned n_wait_semaphores)
+{
         VkResult submit_result = VK_SUCCESS;
+
         if (n_wait_semaphores == 0 &&
             device_data->graphic_queue->queue != present_queue->queue) {
                 VkPipelineStageFlags stages_wait =
@@ -532,7 +545,7 @@ krosshair_draw_t* render_swapchain_display(
                 if (submit_result != VK_SUCCESS) {
                         KROSSHAIR_LOG("[KROSSHAIR] crossengine QueueSubmit failed: %d\n",
                                       submit_result);
-                        return NULL;
+                        return -1;
                 }
 
                 submit_info.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -550,7 +563,7 @@ krosshair_draw_t* render_swapchain_display(
                 if (submit_result != VK_SUCCESS) {
                         KROSSHAIR_LOG("[KROSSHAIR] graphic QueueSubmit failed: %d\n",
                                       submit_result);
-                        return NULL;
+                        return -1;
                 }
                 draw->fence_submitted = 1;
         } else {
@@ -578,16 +591,162 @@ krosshair_draw_t* render_swapchain_display(
                 if (submit_result != VK_SUCCESS) {
                         KROSSHAIR_LOG("[KROSSHAIR] QueueSubmit failed: %d (wait_sems=%u)\n",
                                       submit_result, n_wait_semaphores);
-                        return NULL;
+                        return -1;
                 }
                 draw->fence_submitted = 1;
         }
 
-        return draw;
+        return 0;
 }
 
 /*
- * GPU resources that do not depend on the swapchain (sampler, descriptor
- * pools/layouts, command pool, pipeline layouts).  Created once per device
- * by overlay_CreateDevice, destroyed only in overlay_DestroyDevice.
+ * Render and submit the crosshair overlay for one swapchain image.
+ *
+ * swapchain_data    Per-swapchain state (images, framebuffers, texture,
+ *                  animation, quad vertices, draw slots).
+ * present_queue     The queue this image is being presented on.
+ * wait_semaphores   The app's wait semaphores for this image (NULL when
+ *                  n_wait_semaphores is 0).
+ * n_wait_semaphores How many of the above.
+ * image_index       Index of the swapchain image to render onto.
+ *
+ * Returns the draw slot whose semaphore must be waited on by
+ * vkQueuePresentKHR, or NULL (overlay skipped for this frame).
  */
+krosshair_draw_t* render_swapchain_display(
+    swapchain_data_t* swapchain_data, queue_data_t* present_queue,
+    const VkSemaphore* wait_semaphores, unsigned n_wait_semaphores,
+    unsigned image_index)
+{
+        if (!crosshair_visible)
+                return NULL;
+
+        device_data_t* device_data = swapchain_data->device_data;
+
+        krosshair_draw_t* draw = swapchain_data->draws[image_index];
+        if (!draw) {
+                KROSSHAIR_LOG("[KROSSHAIR] no draw slot for image %u\n", image_index);
+                return NULL;
+        }
+
+        /* Slot reuse: wait for this slot's previous submit to complete
+         * before re-recording its command buffer.  If it does not complete
+         * in time, skip this frame (presented without the overlay
+         * semaphore) — never destroy a slot while its submit is in flight. */
+        if (!wait_draw_slot_ready(device_data, draw, image_index))
+                return NULL;
+
+        device_data->vtable.ResetCommandBuffer(draw->cmd_buffer, 0);
+
+        VkRenderPassBeginInfo render_pass_info = {};
+        render_pass_info.sType       = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        render_pass_info.renderPass  = device_data->render_pass;
+        render_pass_info.framebuffer = swapchain_data->framebuffers[image_index];
+        render_pass_info.renderArea.extent.width   = swapchain_data->width;
+        render_pass_info.renderArea.extent.height  = swapchain_data->height;
+
+        VkCommandBufferBeginInfo buffer_begin_info = {};
+        buffer_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+
+        device_data->vtable.BeginCommandBuffer(draw->cmd_buffer,
+                                               &buffer_begin_info);
+        ensure_swapchain_crosshair(swapchain_data, draw->cmd_buffer);
+        ensure_swapchain_dynamic_mask(swapchain_data, draw->cmd_buffer);
+
+        if (swapchain_data->dynamic_mask.uploaded) {
+                /* shader-based mode: copy the game framebuffer so the
+                 * mask shader can sample it */
+                ensure_game_fb_copy(swapchain_data);
+                record_framebuffer_copy(swapchain_data, draw->cmd_buffer,
+                                        image_index, present_queue);
+        } else {
+                transition_swapchain_for_render(swapchain_data, draw->cmd_buffer,
+                                                image_index, present_queue);
+        }
+
+        device_data->vtable.CmdBeginRenderPass(
+            draw->cmd_buffer, &render_pass_info, VK_SUBPASS_CONTENTS_INLINE);
+
+        /* advance animation frame if needed (GIF or APNG) */
+        advance_anim_frame(swapchain_data, draw);
+
+        ensure_quad_buffers(device_data, swapchain_data, draw);
+
+        device_data->vtable.CmdBindPipeline(
+            draw->cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            device_data->pipeline);
+
+        VkDeviceSize offsets[1] = {0};
+        device_data->vtable.CmdBindVertexBuffers(draw->cmd_buffer, 0, 1,
+                                                 &draw->vertex_buffer, offsets);
+        device_data->vtable.CmdBindIndexBuffer(
+            draw->cmd_buffer, draw->index_buffer, 0, VK_INDEX_TYPE_UINT16);
+
+        VkViewport viewport = {};
+        viewport.x          = 0;
+        viewport.y          = 0;
+        viewport.width      = swapchain_data->width;
+        viewport.height     = swapchain_data->height;
+        viewport.minDepth   = 0.0f;
+        viewport.maxDepth   = 1.0f;
+        device_data->vtable.CmdSetViewport(draw->cmd_buffer, 0, 1, &viewport);
+
+        VkRect2D scissor      = {};
+        scissor.offset.x      = 0;
+        scissor.offset.y      = 0;
+        scissor.extent.width  = swapchain_data->width;
+        scissor.extent.height = swapchain_data->height;
+        device_data->vtable.CmdSetScissor(draw->cmd_buffer, 0, 1, &scissor);
+
+        device_data->vtable.CmdBindDescriptorSets(
+            draw->cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            device_data->pipeline_layout, 0, 1, &swapchain_data->descriptor_set, 0,
+            NULL);
+        device_data->vtable.CmdDrawIndexed(draw->cmd_buffer,
+                                           sizeof(indices) / sizeof(indices[0]),
+                                           1, 0, 0, 0);
+
+        /* single dynamic effect mask draw (optional) */
+        record_dynamic_mask_draw(swapchain_data, draw);
+
+        device_data->vtable.CmdEndRenderPass(draw->cmd_buffer);
+
+        /*
+         * transfer the image back to the present queue family
+         * image layout was already changed to present by the render pass
+         */
+        if (device_data->graphic_queue->family_index !=
+            present_queue->family_index) {
+                VkImageMemoryBarrier return_barrier = {};
+                return_barrier.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                return_barrier.image         = swapchain_data->images[image_index];
+                return_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                return_barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                return_barrier.oldLayout     = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                return_barrier.newLayout     = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                return_barrier.srcQueueFamilyIndex =
+                    device_data->graphic_queue->family_index;
+                return_barrier.dstQueueFamilyIndex = present_queue->family_index;
+                return_barrier.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+                return_barrier.subresourceRange.baseMipLevel   = 0;
+                return_barrier.subresourceRange.levelCount     = 1;
+                return_barrier.subresourceRange.baseArrayLayer = 0;
+                return_barrier.subresourceRange.layerCount     = 1;
+                device_data->vtable.CmdPipelineBarrier(
+                    draw->cmd_buffer, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+                    VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 0, NULL, 0, NULL, 1,
+                    &return_barrier);
+        }
+
+        VkResult end_result = device_data->vtable.EndCommandBuffer(draw->cmd_buffer);
+        if (end_result != VK_SUCCESS) {
+                KROSSHAIR_LOG("[KROSSHAIR] EndCommandBuffer failed: %d\n", end_result);
+                return NULL;
+        }
+
+        if (submit_overlay_draw(device_data, draw, present_queue,
+                                wait_semaphores, n_wait_semaphores) != 0)
+                return NULL;
+
+        return draw;
+}
