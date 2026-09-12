@@ -12,6 +12,7 @@
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +24,29 @@
 #include "../include/stb_image.h"
 #include "../include/default_crosshair.h"
 #include "../include/krosshair.h"
+
+/*
+ * Reset dynamic push constants to safe defaults: every effect off,
+ * identity colors, opacity 1. quad_ndc_min/size are left untouched —
+ * the caller sets those from the canvas geometry.
+ *
+ * pc: push-constants struct written in place.
+ */
+static void reset_dynamic_push_constants(struct dynamic_push_constants* pc)
+{
+        pc->invert_str      = 0.0f;
+        pc->dodge_str       = 0.0f;
+        pc->dodge_r = 1.0f; pc->dodge_g = 1.0f; pc->dodge_b = 1.0f;
+        pc->burn_str        = 0.0f;
+        pc->burn_r = 1.0f;  pc->burn_g = 1.0f;  pc->burn_b = 1.0f;
+        pc->complement_str  = 0.0f;
+        pc->lumainvert_str  = 0.0f;
+        pc->huerotate_str   = 0.0f;
+        pc->huerotate_angle = 180.0f;
+        pc->saturate_str    = 0.0f;
+        pc->saturate_amount = 0.0f;
+        pc->opacity         = 1.0f;
+}
 
 /*
  * Parse a crosshair-maker dynamic .cfg file into shader push
@@ -38,19 +62,7 @@
  */
 static void parse_dynamic_cfg(const char* path, struct dynamic_push_constants* pc)
 {
-        /* zero everything except quad_ndc_min/size (caller sets those) */
-        pc->invert_str      = 0.0f;
-        pc->dodge_str       = 0.0f;
-        pc->dodge_r = 1.0f; pc->dodge_g = 1.0f; pc->dodge_b = 1.0f;
-        pc->burn_str        = 0.0f;
-        pc->burn_r = 1.0f;  pc->burn_g = 1.0f;  pc->burn_b = 1.0f;
-        pc->complement_str  = 0.0f;
-        pc->lumainvert_str  = 0.0f;
-        pc->huerotate_str   = 0.0f;
-        pc->huerotate_angle = 180.0f;
-        pc->saturate_str    = 0.0f;
-        pc->saturate_amount = 0.0f;
-        pc->opacity         = 1.0f;
+        reset_dynamic_push_constants(pc);
 
         if (!path) return;
 
@@ -65,27 +77,27 @@ static void parse_dynamic_cfg(const char* path, struct dynamic_push_constants* p
 
                 char name[64];
                 float a1 = 0, a2 = 0, a3 = 0, a4 = 0;
-                int n = sscanf(line, "%63s %f %f %f %f", name, &a1, &a2, &a3, &a4);
-                if (n < 2) continue;
+                int parsed = sscanf(line, "%63s %f %f %f %f", name, &a1, &a2, &a3, &a4);
+                if (parsed < 2) continue;
 
                 if (strcmp(name, "invert") == 0) {
                         pc->invert_str = a1;
                 } else if (strcmp(name, "dodge") == 0) {
                         pc->dodge_str = a1;
-                        if (n >= 5) { pc->dodge_r = a2; pc->dodge_g = a3; pc->dodge_b = a4; }
+                        if (parsed >= 5) { pc->dodge_r = a2; pc->dodge_g = a3; pc->dodge_b = a4; }
                 } else if (strcmp(name, "burn") == 0) {
                         pc->burn_str = a1;
-                        if (n >= 5) { pc->burn_r = a2; pc->burn_g = a3; pc->burn_b = a4; }
+                        if (parsed >= 5) { pc->burn_r = a2; pc->burn_g = a3; pc->burn_b = a4; }
                 } else if (strcmp(name, "complement") == 0) {
                         pc->complement_str = a1;
                 } else if (strcmp(name, "lumainvert") == 0) {
                         pc->lumainvert_str = a1;
                 } else if (strcmp(name, "huerotate") == 0) {
                         pc->huerotate_str = a1;
-                        if (n >= 3) pc->huerotate_angle = a2;
+                        if (parsed >= 3) pc->huerotate_angle = a2;
                 } else if (strcmp(name, "saturate") == 0) {
                         pc->saturate_str = a1;
-                        if (n >= 3) pc->saturate_amount = a2;
+                        if (parsed >= 3) pc->saturate_amount = a2;
                 } else if (strcmp(name, "opacity") == 0) {
                         pc->opacity = a1;
                 }
@@ -117,7 +129,10 @@ void setup_vertices_uv(vertex_t* vertices,
         float width_ndc  = ((tex_width * scale) / canvas_width);
         float height_ndc = ((tex_height * scale) / canvas_height);
 
-        /* should fix even-length crosshairs */
+        /* Odd-sized canvases have no center pixel — the screen center
+         * falls between two pixels. Shift the whole quad by half a
+         * pixel in NDC (1 px = 2.0/canvas in NDC) to keep it on the
+         * pixel grid. */
         float pixel_offset_x =
             (fmod(canvas_width, 2.0f) == 0) ? 0.0f : (1.0f / canvas_width);
         float pixel_offset_y =
@@ -195,6 +210,126 @@ static int get_file_mtime(const char* path, struct timespec* mtime)
         if (stat(path, &st) != 0) return -1;
         *mtime = st.st_mtim;
         return 0;
+}
+
+/*
+ * Read an entire file into a malloc'd buffer.
+ *
+ * Both in-memory decoders (stbi GIF, load_apng) take a 32-bit length, so
+ * files larger than INT_MAX bytes are rejected here.
+ *
+ * path: file to read;
+ * kind: short label for the error logs (e.g. "GIF");
+ * len:  set to the file size in bytes on success.
+ * Returns the buffer (caller frees), or NULL on open/size/alloc/short-
+ * read failure (each failure is logged).
+ */
+static unsigned char* read_file_whole(const char* path, const char* kind,
+                                      size_t* len)
+{
+        FILE* f = fopen(path, "rb");
+        if (!f) {
+                KROSSHAIR_LOG("[KROSSHAIR_ERROR] failed to open %s: %s\n",
+                              kind, path);
+                return NULL;
+        }
+
+        fseek(f, 0, SEEK_END);
+        long file_len = ftell(f);
+        fseek(f, 0, SEEK_SET);
+
+        if (file_len <= 0 || file_len > (long)INT_MAX) {
+                fclose(f);
+                KROSSHAIR_LOG("[KROSSHAIR_ERROR] invalid %s file size: %ld\n",
+                              kind, file_len);
+                return NULL;
+        }
+
+        unsigned char* buf = malloc((size_t)file_len);
+        if (!buf) {
+                fclose(f);
+                KROSSHAIR_LOG("[KROSSHAIR_ERROR] failed to allocate %s read buffer\n",
+                              kind);
+                return NULL;
+        }
+
+        size_t bytes_read = fread(buf, 1, (size_t)file_len, f);
+        fclose(f);
+
+        if (bytes_read != (size_t)file_len) {
+                free(buf);
+                KROSSHAIR_LOG("[KROSSHAIR_ERROR] short read on %s: %zu/%ld\n",
+                              kind, bytes_read, file_len);
+                return NULL;
+        }
+
+        *len = (size_t)file_len;
+        return buf;
+}
+
+/*
+ * Check whether a file we already uploaded from needs reloading.
+ *
+ * current_path:    path the image was last loaded from;
+ * current_mtime:   mtime recorded at that load;
+ * new_path:        path the file should come from now;
+ * label:           short name for the log lines ("crosshair"/"mask");
+ * log_changes:     log when the path or mtime changed.
+ * Returns 1 if the file moved or its mtime changed, 0 otherwise.
+ */
+static int image_file_changed(const char* current_path,
+                              const struct timespec* current_mtime,
+                              const char* new_path,
+                              const char* label, int log_changes)
+{
+        if (strcmp(current_path, new_path) != 0) {
+                if (log_changes)
+                        KROSSHAIR_LOG("[KROSSHAIR] %s path changed, reloading\n",
+                                      label);
+                return 1;
+        }
+
+        struct timespec new_mtime;
+        if (get_file_mtime(new_path, &new_mtime) == 0 &&
+            (new_mtime.tv_sec != current_mtime->tv_sec ||
+             new_mtime.tv_nsec != current_mtime->tv_nsec)) {
+                if (log_changes)
+                        KROSSHAIR_LOG("[KROSSHAIR] %s mtime changed (%ld.%ld -> %ld.%ld), reloading\n",
+                                      label,
+                                      current_mtime->tv_sec, current_mtime->tv_nsec,
+                                      new_mtime.tv_sec, new_mtime.tv_nsec);
+                return 1;
+        }
+
+        return 0;
+}
+
+/*
+ * Record animation state for a freshly loaded frame atlas: one frame is
+ * drawn per tick, each after its delay in ms.
+ *
+ * data:        swapchain holding the anim_* fields (anim_delays must be
+ *              NULL — on reload it is freed by shutdown_krosshair_image);
+ * frame_count: number of frames stacked in the atlas;
+ * frame_height: height of one frame in pixels;
+ * delays_ms:   per-frame delay in milliseconds, owned by the caller
+ *              (NULL gives a uniform 100 ms delay for every frame).
+ *
+ * Non-positive delays become 100 ms ("as fast as possible" in both
+ * source formats is clamped to a sane tick).
+ */
+static void setup_animation_state(swapchain_data_t* data, int frame_count,
+                                  int frame_height, const int* delays_ms)
+{
+        data->anim_frame_count   = frame_count;
+        data->anim_frame_height  = frame_height;
+        data->anim_current_frame = 0;
+        clock_gettime(CLOCK_MONOTONIC, &data->anim_last_frame_time);
+
+        data->anim_delays = malloc(sizeof(int) * frame_count);
+        for (int i = 0; i < frame_count; i++)
+                data->anim_delays[i] = delays_ms && delays_ms[i] > 0
+                    ? delays_ms[i] : 100;
 }
 
 /*
@@ -288,9 +423,6 @@ static char* get_dynamic_cfg_path(void)
         return NULL;
 }
 
-/* ───────────────────── APNG loader ───────────────────── */
-
-
 /*
  * Make sure this swapchain has an up-to-date crosshair image uploaded.
  *
@@ -317,27 +449,11 @@ void ensure_swapchain_crosshair(swapchain_data_t* data,
         int using_file = (crosshair_path != NULL);
 
         if (data->crosshair_uploaded) {
-                int needs_reload = 0;
-
-                if (using_file && data->crosshair_path) {
-                        if (strcmp(data->crosshair_path, crosshair_path) != 0) {
-                                KROSSHAIR_LOG("[KROSSHAIR] path changed, reloading\n");
-                                needs_reload = 1;
-                        } else {
-                                struct timespec new_mtime;
-                                if (get_file_mtime(crosshair_path, &new_mtime) == 0) {
-                                        if (new_mtime.tv_sec != data->crosshair_mtime.tv_sec ||
-                                            new_mtime.tv_nsec != data->crosshair_mtime.tv_nsec) {
-                                                KROSSHAIR_LOG("[KROSSHAIR] mtime changed (%ld.%ld -> %ld.%ld), reloading\n",
-                                                       data->crosshair_mtime.tv_sec,
-                                                       data->crosshair_mtime.tv_nsec,
-                                                       new_mtime.tv_sec,
-                                                       new_mtime.tv_nsec);
-                                                needs_reload = 1;
-                                        }
-                                }
-                        }
-                }
+                int needs_reload =
+                    using_file && data->crosshair_path &&
+                    image_file_changed(data->crosshair_path,
+                                       &data->crosshair_mtime, crosshair_path,
+                                       "crosshair", 1);
 
                 if (!needs_reload) {
                         free(crosshair_path);
@@ -368,51 +484,19 @@ void ensure_swapchain_crosshair(swapchain_data_t* data,
                 int is_png = ext && (strcasecmp(ext, ".png") == 0);
 
                 if (is_gif) {
-                        FILE* f = fopen(crosshair_path, "rb");
-                        if (!f) {
-                                KROSSHAIR_LOG("[KROSSHAIR_ERROR] failed to open GIF: %s\n",
-                                              crosshair_path);
-                                free(crosshair_path);
-                                return;
-                        }
-
-                        fseek(f, 0, SEEK_END);
-                        long file_len = ftell(f);
-                        fseek(f, 0, SEEK_SET);
-
-                        if (file_len <= 0 || file_len > (long)INT_MAX) {
-                                KROSSHAIR_LOG("[KROSSHAIR_ERROR] invalid GIF file size: %ld\n",
-                                              file_len);
-                                fclose(f);
-                                free(crosshair_path);
-                                return;
-                        }
-
-                        unsigned char* file_buf = malloc((size_t)file_len);
+                        size_t file_len = 0;
+                        unsigned char* file_buf =
+                            read_file_whole(crosshair_path, "GIF", &file_len);
                         if (!file_buf) {
-                                KROSSHAIR_LOG("[KROSSHAIR_ERROR] failed to allocate GIF read buffer\n");
-                                fclose(f);
-                                free(crosshair_path);
-                                return;
-                        }
-
-                        size_t bytes_read = fread(file_buf, 1, (size_t)file_len, f);
-                        fclose(f);
-
-                        if ((long)bytes_read != file_len) {
-                                KROSSHAIR_LOG("[KROSSHAIR_ERROR] short read on GIF: %zu/%ld\n",
-                                              bytes_read, file_len);
-                                free(file_buf);
                                 free(crosshair_path);
                                 return;
                         }
 
                         int* delays = NULL;
                         int frames = 0;
-                        int gif_len = (int)file_len;
                         stbi_uc* gif_data = stbi_load_gif_from_memory(
-                            file_buf, gif_len, &delays, &tex_width, &tex_height,
-                            &frames, &tex_channels, STBI_rgb_alpha);
+                            file_buf, (int)file_len, &delays, &tex_width,
+                            &tex_height, &frames, &tex_channels, STBI_rgb_alpha);
                         free(file_buf);
 
                         if (!gif_data || frames < 1) {
@@ -442,28 +526,9 @@ void ensure_swapchain_crosshair(swapchain_data_t* data,
                         /* tex_height now refers to the full atlas */
                         tex_height = atlas_height;
 
-                        /* store animation state */
-                        data->anim_frame_count  = frames;
-                        data->anim_frame_height = frame_height;
-                        data->anim_current_frame = 0;
-                        clock_gettime(CLOCK_MONOTONIC, &data->anim_last_frame_time);
-
-                        if (delays) {
-                                data->anim_delays = malloc(sizeof(int) * frames);
-                                for (int gi = 0; gi < frames; gi++) {
-                                        /* stbi already converts GIF centisecond
-                                         * delays to milliseconds internally
-                                         * (10 * cs).  delay 0 means "as fast
-                                         * as possible", default to ~100ms */
-                                        data->anim_delays[gi] =
-                                            delays[gi] > 0 ? delays[gi] : 100;
-                                }
-                                free(delays);
-                        } else {
-                                data->anim_delays = malloc(sizeof(int) * frames);
-                                for (int gi = 0; gi < frames; gi++)
-                                        data->anim_delays[gi] = 100;
-                        }
+                        /* stbi already converted GIF centisecond delays to ms */
+                        setup_animation_state(data, frames, frame_height, delays);
+                        free(delays);
 
                         KROSSHAIR_LOG("[KROSSHAIR] loaded GIF atlas: %dx%d (%d frames, frame_h=%d)\n",
                                       tex_width, atlas_height, frames, frame_height);
@@ -471,39 +536,9 @@ void ensure_swapchain_crosshair(swapchain_data_t* data,
                         /* try to load as APNG; if it's a plain PNG the
                          * loader will return NULL (no acTL) and we fall
                          * through to stbi_load below */
-                        FILE* f = fopen(crosshair_path, "rb");
-                        if (!f) {
-                                int err = errno;
-                                if (!kh_msg_shown_load_fail) {
-                                        const char* source = getenv("KROSSHAIR_IMG") ?
-                                                "set via env var 'KROSSHAIR_IMG'" : "at default crosshair location";
-                                        fprintf(stderr, "[KH] Cannot load crosshair image '%s' (%s): %s — falling back to the built-in crosshair\n",
-                                                crosshair_path, source, strerror(err));
-                                        kh_msg_shown_load_fail = 1;
-                                }
-                                KROSSHAIR_LOG("[KROSSHAIR_ERROR] failed to open: %s — falling back to built-in crosshair\n",
-                                              crosshair_path);
-                                free(crosshair_path);
-                                crosshair_path = NULL;
-                                goto fallback_to_built_in;
-                        }
-
-                        fseek(f, 0, SEEK_END);
-                        long file_len = ftell(f);
-                        fseek(f, 0, SEEK_SET);
-
-                        unsigned char* file_buf = NULL;
-                        if (file_len > 0 && file_len <= (long)INT_MAX) {
-                                file_buf = malloc((size_t)file_len);
-                                if (file_buf) {
-                                        size_t bytes_read = fread(file_buf, 1, (size_t)file_len, f);
-                                        if ((long)bytes_read != file_len) {
-                                                free(file_buf);
-                                                file_buf = NULL;
-                                        }
-                                }
-                        }
-                        fclose(f);
+                        size_t file_len = 0;
+                        unsigned char* file_buf =
+                            read_file_whole(crosshair_path, "APNG", &file_len);
 
                         int* apng_delays = NULL;
                         int apng_frames = 0;
@@ -526,12 +561,9 @@ void ensure_swapchain_crosshair(swapchain_data_t* data,
                                 image_size = (VkDeviceSize)tex_width * atlas_height * 4;
                                 pixels = (stbi_uc*)apng_data;
 
-                                data->anim_frame_count   = apng_frames;
-                                data->anim_frame_height  = frame_height;
-                                data->anim_current_frame = 0;
-                                clock_gettime(CLOCK_MONOTONIC, &data->anim_last_frame_time);
-
-                                data->anim_delays = apng_delays;
+                                setup_animation_state(data, apng_frames,
+                                                      frame_height, apng_delays);
+                                free(apng_delays);
 
                                 KROSSHAIR_LOG("[KROSSHAIR] loaded APNG atlas: %dx%d (%d frames, frame_h=%d)\n",
                                               tex_width, atlas_height, apng_frames, frame_height);
@@ -651,8 +683,8 @@ void ensure_swapchain_dynamic_mask(swapchain_data_t* data,
 {
         device_data_t* device_data = data->device_data;
 
-        char* mpath = get_dynamic_mask_path();
-        int using_file = (mpath != NULL);
+        char* mask_path = get_dynamic_mask_path();
+        int using_file = (mask_path != NULL);
 
         /* ── check for mask image reload ──
          * Only entered when a mask was actually uploaded (uploaded != 0); the
@@ -663,28 +695,20 @@ void ensure_swapchain_dynamic_mask(swapchain_data_t* data,
                 int needs_reload = 0;
 
                 if (using_file && data->dynamic_mask.path) {
-                        if (strcmp(data->dynamic_mask.path, mpath) != 0) {
-                                needs_reload = 1;
-                        } else {
-                                struct timespec new_mtime;
-                                if (get_file_mtime(mpath, &new_mtime) == 0) {
-                                        if (new_mtime.tv_sec != data->dynamic_mask.mtime.tv_sec ||
-                                            new_mtime.tv_nsec != data->dynamic_mask.mtime.tv_nsec) {
-                                                needs_reload = 1;
-                                        }
-                                }
-                        }
+                        needs_reload = image_file_changed(
+                            data->dynamic_mask.path, &data->dynamic_mask.mtime,
+                            mask_path, "mask", 0);
                 } else if (!using_file && data->dynamic_mask.path) {
                         shutdown_dynamic_mask(data);
                         data->dynamic_mask.uploaded = 0;
                         free(data->dynamic_mask.path);
                         data->dynamic_mask.path = NULL;
-                        free(mpath);
+                        free(mask_path);
                         return;
                 }
 
                 if (!needs_reload) {
-                        free(mpath);
+                        free(mask_path);
                         /* still check cfg for hot-reload */
                         goto check_cfg;
                 }
@@ -705,17 +729,17 @@ void ensure_swapchain_dynamic_mask(swapchain_data_t* data,
         }
 
         if (!using_file) {
-                free(mpath);
+                free(mask_path);
                 return;
         }
 
         int tex_width, tex_height, tex_channels;
-        stbi_uc* pixels = stbi_load(mpath, &tex_width, &tex_height,
+        stbi_uc* pixels = stbi_load(mask_path, &tex_width, &tex_height,
                                     &tex_channels, STBI_rgb_alpha);
         if (!pixels) {
                 KROSSHAIR_LOG("[KROSSHAIR_ERROR] failed to load dynamic mask: %s\n",
-                              mpath);
-                free(mpath);
+                              mask_path);
+                free(mask_path);
                 return;
         }
 
@@ -734,8 +758,8 @@ void ensure_swapchain_dynamic_mask(swapchain_data_t* data,
             &data->dynamic_mask.upload_buffer_mem, data->dynamic_mask.image);
         stbi_image_free(pixels);
 
-        data->dynamic_mask.path = mpath;
-        get_file_mtime(mpath, &data->dynamic_mask.mtime);
+        data->dynamic_mask.path = mask_path;
+        get_file_mtime(mask_path, &data->dynamic_mask.mtime);
         data->dynamic_mask.tex_width = tex_width;
 
         setup_vertices(data->dynamic_mask.vertices,
@@ -743,7 +767,7 @@ void ensure_swapchain_dynamic_mask(swapchain_data_t* data,
                        (float)tex_width, (float)tex_height, 1.0f);
 
         data->dynamic_mask.uploaded = 1;
-        KROSSHAIR_LOG("[KROSSHAIR] loaded dynamic mask from: %s\n", mpath);
+        KROSSHAIR_LOG("[KROSSHAIR] loaded dynamic mask from: %s\n", mask_path);
 
 check_cfg:
         /* ── check for config file reload ── */
