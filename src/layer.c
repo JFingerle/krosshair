@@ -34,44 +34,97 @@
 #include "../include/keys.h"
 #include "../include/krosshair.h"
 
+/* Lock serializing access to the global object map (vk_obj_map). */
 pthread_mutex_t global_lock;
-VkPhysicalDeviceDriverProperties driver_properties = {};
 
 /* ------------------------------------------------------------------
- * Hotkey toggle state
+ * Physical device registration
  * ------------------------------------------------------------------ */
-static void instance_data_map_physical_devices(instance_data_t* instance_data,
-                                               int map)
+
+/*
+ * Ask the driver for the instance's physical device list.
+ *
+ * instance_data  Per-instance state; provides the instance handle and vtable.
+ * count_out      Receives the number of physical devices.
+ *
+ * Returns a malloc'd array of count_out physical devices; the caller frees it.
+ *
+ * The Vulkan API requires two calls: one with a NULL device array to learn
+ * the count, one with a real array to receive the handles.
+ */
+static VkPhysicalDevice* enumerate_physical_devices(
+    instance_data_t* instance_data, uint32_t* count_out)
 {
-        uint32_t physical_device_count = 0;
+        *count_out = 0;
         instance_data->vtable.EnumeratePhysicalDevices(
-            instance_data->instance, &physical_device_count, NULL);
+            instance_data->instance, count_out, NULL);
 
         VkPhysicalDevice* physical_devices =
-            malloc(sizeof(VkPhysicalDevice) * physical_device_count);
+            malloc(sizeof(VkPhysicalDevice) * *count_out);
         instance_data->vtable.EnumeratePhysicalDevices(
-            instance_data->instance, &physical_device_count, physical_devices);
+            instance_data->instance, count_out, physical_devices);
+        return physical_devices;
+}
+
+/*
+ * Map every physical device into the object map, pointing to the instance.
+ *
+ * A physical device is not its own Vulkan state — it only ever leads to
+ * the instance it belongs to — so overlay_CreateDevice resolves a
+ * VkPhysicalDevice by looking up the instance_data_t stored here.
+ * Each entry gets an asprintf'd display name, freed on unmap.
+ */
+static void register_physical_devices(instance_data_t* instance_data)
+{
+        uint32_t physical_device_count;
+        VkPhysicalDevice* physical_devices =
+            enumerate_physical_devices(instance_data, &physical_device_count);
 
         for (uint32_t i = 0; i < physical_device_count; i++) {
-                if (map) {
-                        KROSSHAIR_LOG("[*] mapping physical_devices[%d] obj: %lu %p\n",
-                               i, HKEY(physical_devices[i]), (void*)instance_data);
-                        char* fmt_phys_device;
-                        asprintf(&fmt_phys_device, "physical_devices[%d]", i);
-                        map_object(HKEY(physical_devices[i]), instance_data,
-                                   fmt_phys_device);
-                } else {
-                        /* free the name string we allocated with asprintf */
-                        vk_object_t obj;
-                        if (vk_map_get(&vk_obj_map, HKEY(physical_devices[i]), &obj))
-                                free((char*)obj.name);
-                        unmap_object(HKEY(physical_devices[i]));
-                }
+                KROSSHAIR_LOG("[*] mapping physical_devices[%d] obj: %lu %p\n",
+                    i, HKEY(physical_devices[i]), (void*)instance_data);
+                char* phys_device_name;
+                asprintf(&phys_device_name, "physical_devices[%d]", i);
+                map_object(HKEY(physical_devices[i]), instance_data,
+                           phys_device_name);
         }
 
         free(physical_devices);
 }
 
+/*
+ * Remove every physical device entry created by register_physical_devices(),
+ * freeing the asprintf'd display names along the way.
+ */
+static void unregister_physical_devices(instance_data_t* instance_data)
+{
+        uint32_t physical_device_count;
+        VkPhysicalDevice* physical_devices =
+            enumerate_physical_devices(instance_data, &physical_device_count);
+
+        for (uint32_t i = 0; i < physical_device_count; i++) {
+                /* free the name string we allocated with asprintf */
+                vk_object_t obj;
+                if (vk_map_get(&vk_obj_map, HKEY(physical_devices[i]), &obj))
+                        free((char*)obj.name);
+                unmap_object(HKEY(physical_devices[i]));
+        }
+
+        free(physical_devices);
+}
+
+/* ------------------------------------------------------------------
+ * Swapchain registry helpers
+ * ------------------------------------------------------------------ */
+
+/*
+ * Allocate, zero-initialize and register the per-swapchain bookkeeping.
+ *
+ * swapchain    The newly created VkSwapchainKHR handle.
+ * device_data  Owning device (used for descriptor-pool teardown later).
+ *
+ * Returns the new swapchain_data_t, already stored in the object map.
+ */
 static swapchain_data_t* new_swapchain_data(VkSwapchainKHR swapchain,
                                             device_data_t* device_data)
 {
@@ -83,49 +136,70 @@ static swapchain_data_t* new_swapchain_data(VkSwapchainKHR swapchain,
                HKEY(swapchain_data->swapchain), (void*)swapchain_data);
         map_object(HKEY(swapchain_data->swapchain), swapchain_data,
                    "swapchain_data->swapchain");
-         return swapchain_data;
- }
+        return swapchain_data;
+}
 
- /* remove `data` from the device's swapchain registry. Only compares the
-  * pointer value — `data` may already be freed when this is called */
- static void unregister_swapchain(device_data_t* device_data,
-                                  swapchain_data_t* data)
- {
-         /* registry is capped at the descriptor-pool maxSets */
-         uint32_t stored = device_data->swapchain_count < KROSSHAIR_MAX_SWAPCHAINS
-                               ? device_data->swapchain_count
-                               : KROSSHAIR_MAX_SWAPCHAINS;
-         for (uint32_t i = 0; i < stored; i++) {
-                 if (device_data->swapchains[i] == data) {
-                         for (uint32_t j = i; j + 1 < stored; j++)
-                                 device_data->swapchains[j] =
-                                     device_data->swapchains[j + 1];
-                         break;
-                 }
-         }
-         if (device_data->swapchain_count > 0) device_data->swapchain_count--;
- }
-
-static VkResult overlay_CreateSwapchainKHR(
-    VkDevice device, const VkSwapchainCreateInfoKHR* pCreateInfo,
-    const VkAllocationCallbacks* pAllocator, VkSwapchainKHR* pSwapchain)
+/*
+ * Remove `data` from the device's swapchain registry. Only compares the
+ * pointer value — `data` may already be freed when this is called
+ * (the DestroyDevice sweep frees entries after removing them).
+ */
+static void unregister_swapchain(device_data_t* device_data,
+                                 swapchain_data_t* data)
 {
-        VkSwapchainCreateInfoKHR create_info = *pCreateInfo;
-        create_info.imageUsage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        /* registry is capped at the descriptor-pool maxSets */
+        uint32_t stored = device_data->swapchain_count < KROSSHAIR_MAX_SWAPCHAINS
+                              ? device_data->swapchain_count
+                              : KROSSHAIR_MAX_SWAPCHAINS;
+        for (uint32_t i = 0; i < stored; i++) {
+                if (device_data->swapchains[i] == data) {
+                        for (uint32_t j = i; j + 1 < stored; j++)
+                                device_data->swapchains[j] =
+                                    device_data->swapchains[j + 1];
+                        break;
+                }
+        }
+        if (device_data->swapchain_count > 0) device_data->swapchain_count--;
+}
+
+/* ------------------------------------------------------------------
+ * Layer entry points (called by the Vulkan loader / dispatch table)
+ * ------------------------------------------------------------------ */
+
+/*
+ * Intercepted vkCreateSwapchainKHR.
+ *
+ * device       VkDevice the swapchain is created for.
+ * create_info  Application's swapchain creation parameters.
+ * allocator    Vulkan allocator callbacks (passed through).
+ * swapchain_out Receives the new VkSwapchainKHR handle.
+ *
+ * The app's imageUsage is extended with COLOR_ATTACHMENT | TRANSFER_SRC so
+ * the game's swapchain images can be used directly as the overlay's render
+ * pass attachments. If create_info->oldSwapchain is set (e.g. a resize),
+ * the old swapchain's layer resources are released after the new one is
+ * successfully created — the driver keeps oldSwapchain valid until then.
+ */
+static VkResult overlay_CreateSwapchainKHR(
+    VkDevice device, const VkSwapchainCreateInfoKHR* create_info,
+    const VkAllocationCallbacks* allocator, VkSwapchainKHR* swapchain_out)
+{
+        VkSwapchainCreateInfoKHR modified_info = *create_info;
+        modified_info.imageUsage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 
         device_data_t* device_data = FIND_OBJ(device_data_t, device);
 
         /* save reference to old swapchain data - we must NOT destroy it before
          * the create call because the driver needs oldSwapchain to be valid */
         swapchain_data_t* old_swapchain_data = NULL;
-        if (pCreateInfo->oldSwapchain != VK_NULL_HANDLE) {
+        if (create_info->oldSwapchain != VK_NULL_HANDLE) {
                 old_swapchain_data =
-                    FIND_OBJ(swapchain_data_t, pCreateInfo->oldSwapchain);
+                    FIND_OBJ(swapchain_data_t, create_info->oldSwapchain);
         }
 
         VkResult result = device_data->vtable.CreateSwapchainKHR(
-            device, &create_info, pAllocator, pSwapchain);
+            device, &modified_info, allocator, swapchain_out);
         if (result != VK_SUCCESS) return result;
 
         /* now that the new swapchain is created, clean up the old one's
@@ -138,7 +212,7 @@ static VkResult overlay_CreateSwapchainKHR(
         }
 
         swapchain_data_t* swapchain_data =
-            new_swapchain_data(*pSwapchain, device_data);
+            new_swapchain_data(*swapchain_out, device_data);
 
         device_data->swapchain_count++;
         if (device_data->swapchain_count > 1) {
@@ -161,19 +235,29 @@ static VkResult overlay_CreateSwapchainKHR(
                 device_data->swapchains[device_data->swapchain_count - 1] =
                     swapchain_data;
 
-        setup_swapchain_data(swapchain_data, pCreateInfo);
+        setup_swapchain_data(swapchain_data, create_info);
 
         KROSSHAIR_LOG("[KROSSHAIR] CreateSwapchainKHR: created %lu (%ux%u, n_images=%u, old=%lu)\n",
-                      (unsigned long)*pSwapchain, pCreateInfo->imageExtent.width,
-                      pCreateInfo->imageExtent.height, swapchain_data->n_images,
-                      (unsigned long)pCreateInfo->oldSwapchain);
+                      (unsigned long)*swapchain_out, create_info->imageExtent.width,
+                      create_info->imageExtent.height, swapchain_data->n_images,
+                      (unsigned long)create_info->oldSwapchain);
 
         return result;
 }
 
+/*
+ * Intercepted vkDestroySwapchainKHR.
+ *
+ * device      VkDevice owning the swapchain.
+ * swapchain   Handle being destroyed.
+ * allocator   Vulkan allocator callbacks (passed through).
+ *
+ * Releases the overlay resources attached to this swapchain (and its
+ * bookkeeping) before forwarding the call down the layer chain.
+ */
 static void overlay_DestroySwapchainKHR(VkDevice device,
                                         VkSwapchainKHR swapchain,
-                                        const VkAllocationCallbacks* pAllocator)
+                                        const VkAllocationCallbacks* allocator)
 {
         device_data_t* device_data = FIND_OBJ(device_data_t, device);
         swapchain_data_t* data     = FIND_OBJ(swapchain_data_t, swapchain);
@@ -186,66 +270,70 @@ static void overlay_DestroySwapchainKHR(VkDevice device,
         }
 
         device_data->vtable.DestroySwapchainKHR(device_data->device,
-                                                swapchain, pAllocator);
+                                                swapchain, allocator);
 }
 
-static VkResult overlay_CreateInstance(const VkInstanceCreateInfo* pCreateInfo,
-                                       const VkAllocationCallbacks* pAllocator,
-                                       VkInstance* pInstance)
+/*
+ * Intercepted vkCreateInstance.
+ *
+ * create_info  Application's instance creation parameters.
+ * allocator    Vulkan allocator callbacks (passed through).
+ * instance_out Receives the new VkInstance handle.
+ *
+ * Starts the input thread, unwraps the loader's layer-link info from
+ * create_info->pNext to reach the next layer's entry points, creates the
+ * real instance below us, then loads the instance-level dispatch table
+ * and registers all physical devices in the object map.
+ */
+static VkResult overlay_CreateInstance(const VkInstanceCreateInfo* create_info,
+                                       const VkAllocationCallbacks* allocator,
+                                       VkInstance* instance_out)
 {
         init_input_thread();
 
         VkLayerInstanceCreateInfo* chain_info =
-            get_instance_chain_info(pCreateInfo, VK_LAYER_LINK_INFO);
+            get_instance_chain_info(create_info, VK_LAYER_LINK_INFO);
         assert(chain_info->u.pLayerInfo);
-        PFN_vkGetInstanceProcAddr fpGetInstanceProcAddr =
+        PFN_vkGetInstanceProcAddr next_gpa =
             chain_info->u.pLayerInfo->pfnNextGetInstanceProcAddr;
-        PFN_vkCreateInstance fpCreateInstance =
-            (PFN_vkCreateInstance)fpGetInstanceProcAddr(NULL,
-                                                        "vkCreateInstance");
-        if (!fpCreateInstance) {
+        PFN_vkCreateInstance next_create_instance =
+            (PFN_vkCreateInstance)next_gpa(NULL, "vkCreateInstance");
+        if (!next_create_instance) {
                 return VK_ERROR_INITIALIZATION_FAILED;
         }
 
+        /* step past our layer's link-info node in the pNext chain */
         chain_info->u.pLayerInfo = chain_info->u.pLayerInfo->pNext;
 
-        VkResult result = fpCreateInstance(pCreateInfo, pAllocator, pInstance);
+        VkResult result = next_create_instance(create_info, allocator, instance_out);
         if (result != VK_SUCCESS) return result;
 
-        instance_data_t* instance_data = new_instance_data(*pInstance);
+        instance_data_t* instance_data = new_instance_data(*instance_out);
         vk_load_instance_commands(instance_data->instance,
-                                  fpGetInstanceProcAddr,
+                                  next_gpa,
                                   &instance_data->vtable);
         /* capture the next-link DestroyInstance (the vtable entry above is the
          * gpa-lookup, which the loader commonly leaves NULL) */
         instance_data->chain_DestroyInstance =
-            (PFN_vkDestroyInstance)fpGetInstanceProcAddr(NULL,
-                                                         "vkDestroyInstance");
-        instance_data_map_physical_devices(instance_data, 1);
+            (PFN_vkDestroyInstance)next_gpa(NULL, "vkDestroyInstance");
+        register_physical_devices(instance_data);
 
         return result;
 }
 
-
-static krosshair_draw_t* before_present(swapchain_data_t* swapchain_data,
-                                        queue_data_t* present_queue,
-                                        const VkSemaphore* wait_semaphores,
-                                        unsigned n_wait_semaphores,
-                                        unsigned image_index)
-{
-        krosshair_draw_t* draw = NULL;
-
-        draw = render_swapchain_display(swapchain_data, present_queue,
-                                        wait_semaphores, n_wait_semaphores,
-                                        image_index);
-
-        return draw;
-}
-
+/*
+ * Find this layer's node in a device create-info pNext chain.
+ *
+ * create_info  Device creation parameters to walk.
+ * func         VkLayerFunction tag identifying which node we want
+ *              (VK_LAYER_LINK_INFO, VK_LOADER_DATA_CALLBACK, ...).
+ *
+ * Returns the matching VkLayerDeviceCreateInfo, or NULL.
+ */
 static VkLayerDeviceCreateInfo* get_device_chain_info(
-    const VkDeviceCreateInfo* pCreateInfo, VkLayerFunction func)
+    const VkDeviceCreateInfo* create_info, VkLayerFunction func)
 {
-        vk_foreach_struct(item, pCreateInfo->pNext)
+        vk_foreach_struct(item, create_info->pNext)
         {
                 if (item->sType ==
                         VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO &&
@@ -255,102 +343,69 @@ static VkLayerDeviceCreateInfo* get_device_chain_info(
         return NULL;
 }
 
+/*
+ * Intercepted vkCreateDevice.
+ *
+ * physical_device  Physical device the logical device is created on.
+ * create_info      Application's device creation parameters.
+ * allocator        Vulkan allocator callbacks (passed through).
+ * device_out       Receives the new VkDevice handle.
+ *
+ * Unwraps the loader chain to reach the next layer's entry points, creates
+ * the real device below us, then builds our per-device state: dispatch
+ * table, queue registry, device properties and the stable GPU resources
+ * (sampler, descriptor pools, command pool, pipeline layouts).
+ */
 static VkResult overlay_CreateDevice(VkPhysicalDevice physical_device,
-                                     const VkDeviceCreateInfo* pCreateInfo,
-                                     const VkAllocationCallbacks* pAllocator,
-                                     VkDevice* pDevice)
+                                     const VkDeviceCreateInfo* create_info,
+                                     const VkAllocationCallbacks* allocator,
+                                     VkDevice* device_out)
 {
         instance_data_t* instance_data =
             FIND_OBJ(instance_data_t, physical_device);
         VkLayerDeviceCreateInfo* chain_info =
-            get_device_chain_info(pCreateInfo, VK_LAYER_LINK_INFO);
+            get_device_chain_info(create_info, VK_LAYER_LINK_INFO);
 
         assert(chain_info->u.pLayerInfo);
-        PFN_vkGetInstanceProcAddr fpGetInstanceProcAddr =
+        PFN_vkGetInstanceProcAddr next_gpa =
             chain_info->u.pLayerInfo->pfnNextGetInstanceProcAddr;
-        PFN_vkGetDeviceProcAddr fpGetDeviceProcAddr =
+        PFN_vkGetDeviceProcAddr next_gdpa =
             chain_info->u.pLayerInfo->pfnNextGetDeviceProcAddr;
-        PFN_vkCreateDevice fpCreateDevice =
-            (PFN_vkCreateDevice)fpGetInstanceProcAddr(NULL, "vkCreateDevice");
-        if (fpCreateDevice == NULL) {
+        PFN_vkCreateDevice next_create_device =
+            (PFN_vkCreateDevice)next_gpa(NULL, "vkCreateDevice");
+        if (next_create_device == NULL) {
                 return VK_ERROR_INITIALIZATION_FAILED;
         }
 
+        /* step past our layer's link-info node in the pNext chain */
         chain_info->u.pLayerInfo = chain_info->u.pLayerInfo->pNext;
 
-        /*
-         * this whole driver stuff doesn't seem necessary?
-         * */
-        // const char** enabled_extensions = malloc(
-        //     sizeof(*enabled_extensions) *
-        //     pCreateInfo->enabledExtensionCount);
-        // for (size_t i = 0; i < pCreateInfo->enabledExtensionCount; i++) {
-        //         enabled_extensions[i] =
-        //         pCreateInfo->ppEnabledExtensionNames[i];
-        // };
-        //
-        // uint32_t extension_count;
-        // instance_data->vtable.EnumerateDeviceExtensionProperties(
-        //     physical_device, NULL, &extension_count, NULL);
-        //
-        // VkExtensionProperties* available_extensions =
-        //     malloc(sizeof(*available_extensions) * extension_count);
-        // instance_data->vtable.EnumerateDeviceExtensionProperties(
-        //     physical_device, NULL, &extension_count, available_extensions);
-        //
-        // uint32_t found_extensions = 0;
-        // // TODO: this works?
-        // for (size_t i = 0; i < pCreateInfo->enabledExtensionCount; i++) {
-        //         for (size_t j = 0; j < pCreateInfo->enabledExtensionCount;
-        //              j++) {
-        //                 printf("available_extensions[%lu]: %s\n", i,
-        //                        available_extensions[i].extensionName);
-        //                 printf("enabled_extensions[%lu]: %s\n", i,
-        //                        enabled_extensions[j]);
-        //                 if (!strcmp(available_extensions[i].extensionName,
-        //                             enabled_extensions[j])) {
-        //                         found_extensions = found_extensions + 1;
-        //                 }
-        //         }
-        // }
-        // free(available_extensions);
-        // free(enabled_extensions);
-        // if (found_extensions != pCreateInfo->enabledExtensionCount) {
-        //         printf(
-        //             "[KROSSHAIR_ERROR] extensions don't match. "
-        //             "found_extensions: %d, enabled_extensions: %d\n",
-        //             found_extensions, pCreateInfo->enabledExtensionCount);
-        // }
-
         VkResult result =
-            fpCreateDevice(physical_device, pCreateInfo, pAllocator, pDevice);
+            next_create_device(physical_device, create_info, allocator, device_out);
         if (result != VK_SUCCESS) {
                 return result;
         }
 
-        device_data_t* device_data   = new_device_data(*pDevice, instance_data);
+        device_data_t* device_data   = new_device_data(*device_out, instance_data);
         device_data->physical_device = physical_device;
-        vk_load_device_commands(*pDevice, fpGetDeviceProcAddr,
+        vk_load_device_commands(*device_out, next_gdpa,
                                 &device_data->vtable);
         /* capture the next-link DestroyDevice (the vtable entry above is the
          * gpa-lookup, which the loader commonly leaves NULL) */
         device_data->chain_DestroyDevice =
-            (PFN_vkDestroyDevice)fpGetInstanceProcAddr(NULL,
-                                                       "vkDestroyDevice");
+            (PFN_vkDestroyDevice)next_gpa(NULL, "vkDestroyDevice");
 
         instance_data->vtable.GetPhysicalDeviceProperties(
             device_data->physical_device, &device_data->properties);
 
+        /* remember how to hand the device back to the loader (required by
+         * the implicit layer contract before vkDestroyDevice) */
         VkLayerDeviceCreateInfo* load_data_info =
-            get_device_chain_info(pCreateInfo, VK_LOADER_DATA_CALLBACK);
+            get_device_chain_info(create_info, VK_LOADER_DATA_CALLBACK);
         device_data->set_device_loader_data =
             load_data_info->u.pfnSetDeviceLoaderData;
 
-        // driver_properties.sType =
-        //     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
-        // driver_properties.pNext = NULL;
-
-        device_map_queues(device_data, pCreateInfo);
+        device_map_queues(device_data, create_info);
 
         /* stable GPU resources (sampler, descriptor pools, cmd pool,
          * pipeline layouts) — created once per device */
@@ -359,8 +414,21 @@ static VkResult overlay_CreateDevice(VkPhysicalDevice physical_device,
         return result;
 }
 
+/*
+ * Intercepted vkQueuePresentKHR.
+ *
+ * queue          Presentation queue.
+ * present_info   The app's present request (may list several swapchains).
+ *
+ * The app presents its swapchains one batch at a time, but the overlay has
+ * to submit its draw on each swapchain's image individually, so this
+ * splits the request: for every swapchain it renders the overlay (when
+ * visible), then issues a single-swapchain QueuePresentKHR that also waits
+ * on the overlay's completion semaphore. Per-swapchain results are written
+ * back into present_info->pResults.
+ */
 static VkResult overlay_QueuePresentKHR(VkQueue queue,
-                                        const VkPresentInfoKHR* pPresentInfo)
+                                        const VkPresentInfoKHR* present_info)
 {
         queue_data_t* queue_data = FIND_OBJ(queue_data_t, queue);
 
@@ -370,44 +438,47 @@ static VkResult overlay_QueuePresentKHR(VkQueue queue,
         }
 
         VkResult result          = VK_SUCCESS;
-        for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
-                VkSwapchainKHR swapchain = pPresentInfo->pSwapchains[i];
+        for (uint32_t i = 0; i < present_info->swapchainCount; i++) {
+                VkSwapchainKHR swapchain = present_info->pSwapchains[i];
                 swapchain_data_t* swapchain_data =
                     FIND_OBJ(swapchain_data_t, swapchain);
 
-                uint32_t image_index          = pPresentInfo->pImageIndices[i];
+                uint32_t image_index          = present_info->pImageIndices[i];
 
-                VkPresentInfoKHR present_info = *pPresentInfo;
-                present_info.swapchainCount   = 1;
-                present_info.pSwapchains      = &swapchain;
-                present_info.pImageIndices    = &image_index;
+                /* a copy of the app's present info narrowed to this one swapchain */
+                VkPresentInfoKHR single_present = *present_info;
+                single_present.swapchainCount   = 1;
+                single_present.pSwapchains      = &swapchain;
+                single_present.pImageIndices    = &image_index;
 
                 krosshair_draw_t* draw = NULL;
                 if (swapchain_data) {
-                        /* Known limitation: only i == 0 receives the app's wait
+                        /* render the overlay onto this swapchain's image
+                         * (no-op when the crosshair is hidden).
+                         * Known limitation: only i == 0 receives the app's wait
                          * semaphores; subsequent swapchains draw with
                          * n_wait_semaphores == 0. If two swapchains share a
                          * graphics queue, the second overlay submit does not wait
                          * on the app's semaphore and can race the game's writes to
                          * its image. Pre-existing; not introduced by the leak fix. */
-                        draw = before_present(
+                        draw = render_swapchain_display(
                             swapchain_data, queue_data,
-                            pPresentInfo->pWaitSemaphores,
-                            i == 0 ? pPresentInfo->waitSemaphoreCount : 0,
+                            present_info->pWaitSemaphores,
+                            i == 0 ? present_info->waitSemaphoreCount : 0,
                             image_index);
                 }
 
                 if (draw) {
-                        present_info.pWaitSemaphores    = &draw->semaphore;
-                        present_info.waitSemaphoreCount = 1;
+                        single_present.pWaitSemaphores    = &draw->semaphore;
+                        single_present.waitSemaphoreCount = 1;
                 }
 
                 VkResult chain_result =
                     queue_data->device->vtable.QueuePresentKHR(queue,
-                                                               &present_info);
+                                                               &single_present);
 
-                if (present_info.pResults) {
-                        pPresentInfo->pResults[i] = chain_result;
+                if (single_present.pResults) {
+                        present_info->pResults[i] = chain_result;
                 }
                 if (chain_result != VK_SUCCESS && result == VK_SUCCESS) {
                         result = chain_result;
@@ -417,31 +488,52 @@ static VkResult overlay_QueuePresentKHR(VkQueue queue,
         return result;
 }
 
+/*
+ * Intercepted vkAllocateCommandBuffers.
+ *
+ * device             VkDevice to allocate on.
+ * allocate_info      Allocation parameters (pool, level, count).
+ * command_buffers_out Receives the allocated handles.
+ *
+ * Forwards the allocation down the chain and records per-command-buffer
+ * bookkeeping for each handle so later submissions can be intercepted.
+ *
+ * KNOWN LIMITATION: the object-map entries are never unmapped — there is
+ * no vkFreeCommandBuffers interception. They accumulate for the process
+ * lifetime (the app frees its command buffers, but the map keeps the host
+ * bookkeeping). Pre-existing; out of scope for the leak fix.
+ */
 static VkResult overlay_AllocateCommandBuffers(
-    VkDevice device, const VkCommandBufferAllocateInfo* pAllocateInfo,
-    VkCommandBuffer* pCommandBuffers)
+    VkDevice device, const VkCommandBufferAllocateInfo* allocate_info,
+    VkCommandBuffer* command_buffers_out)
 {
         device_data_t* device_data = FIND_OBJ(device_data_t, device);
         VkResult result            = device_data->vtable.AllocateCommandBuffers(
-            device, pAllocateInfo, pCommandBuffers);
+            device, allocate_info, command_buffers_out);
         if (result != VK_SUCCESS) return result;
 
-        for (uint32_t i = 0; i < pAllocateInfo->commandBufferCount; i++) {
-                new_cmd_buffer_data(pCommandBuffers[i], pAllocateInfo->level,
+        for (uint32_t i = 0; i < allocate_info->commandBufferCount; i++) {
+                new_cmd_buffer_data(command_buffers_out[i], allocate_info->level,
                                     device_data);
         }
 
-        /* KNOWN LIMITATION: the vk_obj_map entries above are never unmapped —
-         * there is no vkFreeCommandBuffers interception. The entries accumulate
-         * for the process lifetime (the app frees its command buffers, but the
-         * map keeps the host bookkeeping). Pre-existing; out of scope for this
-         * leak fix. */
+        return result;
+}
 
-         return result;
-  }
-
+/*
+ * Intercepted vkDestroyDevice.
+ *
+ * device    VkDevice being destroyed.
+ * allocator Vulkan allocator callbacks (passed through).
+ *
+ * Tears down all host bookkeeping for this device (surviving swapchains,
+ * queue data, the device entry itself) before forwarding the destroy call
+ * down the layer chain. Device-scoped GPU objects (sampler, pools, cmd
+ * pool, layouts, render pass, pipelines) are reclaimed by the driver when
+ * the underlying device is destroyed, so they are not freed explicitly.
+ */
 static void overlay_DestroyDevice(VkDevice device,
-                                  const VkAllocationCallbacks* pAllocator)
+                                  const VkAllocationCallbacks* allocator)
 {
         device_data_t* device_data = FIND_OBJ(device_data_t, device);
         if (!device_data) {
@@ -453,11 +545,6 @@ static void overlay_DestroyDevice(VkDevice device,
 
         PFN_vkDestroyDevice chain_destroy = device_data->chain_DestroyDevice;
 
-        /* device-scoped GPU objects (sampler, descriptor pools, cmd pool,
-         * layouts, render pass, pipelines) are reclaimed by the driver when
-         * the underlying device is destroyed, so we do not destroy them
-         * explicitly here. Only the host bookkeeping must be freed. */
-
         /* tear down any swapchains that survived for this device (the app can
          * destroy the device while swapchains are still alive during shutdown).
          * destroy_swapchain_data does the GPU teardown + host-string frees;
@@ -465,10 +552,10 @@ static void overlay_DestroyDevice(VkDevice device,
          * Assumes the registry is consistent, which only holds while the live
          * count stays <= KROSSHAIR_MAX_SWAPCHAINS (see the registration site
          * in overlay_CreateSwapchainKHR for the >cap desync limitation). */
-        uint32_t n = device_data->swapchain_count;
-        if (n > KROSSHAIR_MAX_SWAPCHAINS)
-                n = KROSSHAIR_MAX_SWAPCHAINS; /* registry cap */
-        for (uint32_t i = 0; i < n; i++) {
+        uint32_t n_tracked = device_data->swapchain_count;
+        if (n_tracked > KROSSHAIR_MAX_SWAPCHAINS)
+                n_tracked = KROSSHAIR_MAX_SWAPCHAINS; /* registry cap */
+        for (uint32_t i = 0; i < n_tracked; i++) {
                 swapchain_data_t* sc = device_data->swapchains[i];
                 if (!sc) continue;
                 KROSSHAIR_LOG(
@@ -494,12 +581,22 @@ static void overlay_DestroyDevice(VkDevice device,
         free(device_data);
 
         if (chain_destroy) {
-                chain_destroy(device, pAllocator);
+                chain_destroy(device, allocator);
         }
 }
 
+/*
+ * Intercepted vkDestroyInstance.
+ *
+ * instance   VkInstance being destroyed.
+ * allocator  Vulkan allocator callbacks (passed through).
+ *
+ * Unregisters the physical-device map entries (freeing their display
+ * names) and the instance entry itself, then forwards the destroy call
+ * down the layer chain.
+ */
 static void overlay_DestroyInstance(VkInstance instance,
-                                    const VkAllocationCallbacks* pAllocator)
+                                    const VkAllocationCallbacks* allocator)
 {
         instance_data_t* instance_data = FIND_OBJ(instance_data_t, instance);
         if (!instance_data) {
@@ -513,18 +610,22 @@ static void overlay_DestroyInstance(VkInstance instance,
         PFN_vkDestroyInstance chain_destroy =
             instance_data->chain_DestroyInstance;
 
-        /* free the physical-device map entries + asprintf'd names (the (…,0)
-         * path is the only place they're freed); must run before freeing
-         * instance_data since it reads the vtable + instance handle. */
-        instance_data_map_physical_devices(instance_data, 0);
+        /* free the physical-device map entries + asprintf'd names; must run
+         * before freeing instance_data since it reads the vtable + instance
+         * handle. */
+        unregister_physical_devices(instance_data);
 
         unmap_object(HKEY(instance_data->instance));
         free(instance_data);
 
         if (chain_destroy) {
-                chain_destroy(instance, pAllocator);
+                chain_destroy(instance, allocator);
         }
 }
+
+/* ------------------------------------------------------------------
+ * Name-to-function dispatch (backs GetInstance/GetDeviceProcAddr)
+ * ------------------------------------------------------------------ */
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 overlay_GetInstanceProcAddr(VkInstance instance, const char* func_name);
@@ -549,9 +650,17 @@ name_to_funcptr_t name_to_funcptr_map[] = {
     {"AllocateCommandBuffers", (void*)overlay_AllocateCommandBuffers}
 };
 
-size_t name_to_funcptr_map_count =
+static size_t name_to_funcptr_map_count =
     (sizeof(name_to_funcptr_map) / sizeof(name_to_funcptr_map[0]));
 
+/*
+ * Look up a Vulkan function name in the layer's override table.
+ *
+ * name  The function name as queried (e.g. "vkCreateDevice").
+ *
+ * Returns the overriding function, or NULL to fall through to the next
+ * layer / driver.
+ */
 static void* find_ptr(const char* name)
 {
         for (uint32_t i = 0; i < name_to_funcptr_map_count; i++) {
@@ -562,11 +671,19 @@ static void* find_ptr(const char* name)
         return NULL;
 }
 
+/*
+ * Intercepted vkGetInstanceProcAddr.
+ *
+ * instance  Instance handle, or NULL when querying before creation.
+ * func_name Name of the function to resolve.
+ *
+ * Returns the layer's override if one exists, otherwise forwards the
+ * query to the next layer/driver in the chain.
+ */
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 overlay_GetInstanceProcAddr(VkInstance instance, const char* func_name)
 {
         void* ptr = find_ptr(func_name);
-        // printf("found function %s at %p\n", func_name, ptr);
         if (ptr) return (PFN_vkVoidFunction)ptr;
         if (instance == NULL) return NULL;
 
@@ -576,6 +693,15 @@ overlay_GetInstanceProcAddr(VkInstance instance, const char* func_name)
         return instance_data->vtable.GetInstanceProcAddr(instance, func_name);
 }
 
+/*
+ * Intercepted vkGetDeviceProcAddr.
+ *
+ * device    Device handle (may be NULL when the query does not need it).
+ * func_name Name of the function to resolve.
+ *
+ * Returns the layer's override if one exists, otherwise forwards the
+ * query to the next layer/driver in the chain.
+ */
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 overlay_GetDeviceProcAddr(VkDevice device, const char* func_name)
 {
