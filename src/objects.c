@@ -1,3 +1,12 @@
+/*
+ * Vulkan object bookkeeping.
+ *
+ * Owns the vk_obj_map that associates Vulkan handles with per-instance
+ * and per-device state, and provides the allocation of that state
+ * (instance, device, queue, command-buffer data) plus queue discovery
+ * and chain-info lookup used by the layer entry points.
+ */
+
 #include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>

@@ -1,3 +1,13 @@
+/*
+ * Overlay rendering.
+ *
+ * Records and submits the crosshair draw for a presented swapchain
+ * image: reuses the per-image draw ring slot (waiting on its fence so a
+ * slot is never re-recorded mid-submit), renders the crosshair quad
+ * into the application's framebuffer, and hands back the draw whose
+ * overlay semaphore the layer folds into vkQueuePresentKHR.
+ */
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>

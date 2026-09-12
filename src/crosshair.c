@@ -1,3 +1,14 @@
+/*
+ * Crosshair image handling.
+ *
+ * Loads the user's crosshair image (PNG/APNG) and the optional dynamic
+ * mask, decodes it, builds the per-swapchain crosshair draw data
+ * (vertex buffers with UV coordinates, draw ring slots) and hot-reloads
+ * everything when the files on disk change. Owns the stb_image
+ * implementation (STB_IMAGE_IMPLEMENTATION lives in this translation
+ * unit).
+ */
+
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>

@@ -1,3 +1,12 @@
+/*
+ * Input subsystem.
+ *
+ * Scans /dev/input for keyboard devices and runs a background thread
+ * that watches hotkey press/release events (evdev) to toggle the
+ * crosshair's visibility (crosshair_visible) and handle the
+ * show-once behavior.
+ */
+
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>

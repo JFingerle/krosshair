@@ -1,3 +1,14 @@
+/*
+ * GPU resource management.
+ *
+ * Creates and tears down all Vulkan resources: the device-scoped stable
+ * resources (render pass, pipelines, descriptor pools, shader modules,
+ * command pool) which survive swapchain recreation, and the
+ * swapchain-scoped ones (images, views, framebuffers, vertex/index
+ * buffers, upload buffers). Also handles image/mask hot-reload
+ * shutdown paths used by the crosshair module.
+ */
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

@@ -1,3 +1,13 @@
+/*
+ * Animated PNG (APNG) decoding.
+ *
+ * Parses the APNG frame metadata (acTL/fcTL/fcHD chunks), decodes and
+ * composites each frame with stb_image, and returns them as a vertical
+ * atlas with per-frame delays — the same layout the stb GIF loader
+ * produces — so the crosshair module can treat animated crosshairs like
+ * GIFs.
+ */
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

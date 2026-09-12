@@ -1,3 +1,14 @@
+/*
+ * Vulkan implicit layer entry points.
+ *
+ * This is the API surface of the layer: the overlay_* functions the
+ * loader and dispatch table call (CreateInstance, CreateDevice,
+ * CreateSwapchainKHR, QueuePresentKHR, ...), plus the name-to-function
+ * map that backs vkGetInstanceProcAddr/vkGetDeviceProcAddr. All
+ * implementation work lives in the other translation units
+ * (input, objects, gpu, crosshair, apng, render).
+ */
+
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
