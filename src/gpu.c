@@ -777,12 +777,12 @@ void create_device_stable_resources(device_data_t* device_data)
  * destroys it right after CreateGraphicsPipelines.
  *
  * device_data: device to create the module on;
- * code:        compiled SPIR-V words;
+ * code:        compiled SPIR-V bytecode;
  * code_size:   its size in bytes.
  * Returns the new shader module.
  */
 static VkShaderModule create_shader_module(device_data_t* device_data,
-                                            const uint32_t* code,
+                                            const void* code,
                                             size_t code_size)
 {
         VkShaderModuleCreateInfo module_info = {};
