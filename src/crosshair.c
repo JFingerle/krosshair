@@ -181,12 +181,8 @@ static char* get_crosshair_file(const char* path)
 
         if (!(path[0] == '~')) return strdup(path);
 
-        const char* home_dir = NULL;
-
-        if (path[1] == '/' || path[1] == '\0') {
-                home_dir = getenv("HOME");
-                if (!home_dir) return NULL;
-        }
+        const char* home_dir = getenv("HOME");
+        if (!home_dir) return NULL;
 
         const char* rest_str = path + 1;
         while (*rest_str && *rest_str != '/') rest_str++;
@@ -424,6 +420,143 @@ static char* get_dynamic_cfg_path(void)
 }
 
 /*
+ * Decode a crosshair image file (GIF, APNG or PNG) into an RGBA pixel
+ * buffer.
+ *
+ * Animated sources (GIF, multi-frame APNG) are laid out as a vertical
+ * frame atlas — all frames stacked top to bottom in a single image — and
+ * their per-frame delays are recorded on the swapchain via
+ * setup_animation_state, so *out_height is the full atlas height for
+ * animations.
+ *
+ * data:           swapchain to record the animation state in (only
+ *                 touched for animated sources);
+ * path:           image file to decode;
+ * out_pixels:     set to the decoded RGBA pixels (free with
+ *                 stbi_image_free), or NULL on failure;
+ * out_width:      set to the texture width in pixels;
+ * out_height:     set to the texture height in pixels (full atlas for
+ *                 animations);
+ * out_image_size: set to the pixel data size in bytes.
+ *
+ * Returns 1 if a valid image was decoded, 0 on failure (already logged).
+ */
+static int decode_crosshair_file(swapchain_data_t* data, const char* path,
+                                 stbi_uc** out_pixels, int* out_width,
+                                 int* out_height, VkDeviceSize* out_image_size)
+{
+        *out_pixels = NULL;
+
+        const char* ext = strrchr(path, '.');
+        int is_gif  = ext && (strcasecmp(ext, ".gif") == 0);
+        int is_apng = ext && (strcasecmp(ext, ".apng") == 0);
+
+        /* .png files might also be APNG -- detect by checking for
+         * acTL chunk if the extension is .png */
+        int is_png = ext && (strcasecmp(ext, ".png") == 0);
+
+        if (is_gif) {
+                size_t file_len = 0;
+                unsigned char* file_buf =
+                    read_file_whole(path, "GIF", &file_len);
+                if (!file_buf)
+                        return 0;
+
+                int* delays = NULL;
+                int frames = 0;
+                int tex_channels;
+                *out_pixels = stbi_load_gif_from_memory(
+                    file_buf, (int)file_len, &delays, out_width,
+                    out_height, &frames, &tex_channels, STBI_rgb_alpha);
+                free(file_buf);
+
+                if (!*out_pixels || frames < 1) {
+                        KROSSHAIR_LOG("[KROSSHAIR_ERROR] failed to decode GIF: %s (%s)\n",
+                                      path,
+                                      *out_pixels ? "no frames" : "decode error");
+                        if (*out_pixels) stbi_image_free(*out_pixels);
+                        if (delays) free(delays);
+                        *out_pixels = NULL;
+                        return 0;
+                }
+
+                /*
+                 * Build a vertical texture atlas: all frames stacked
+                 * top-to-bottom in a single image.  The UV coordinates
+                 * are adjusted per-frame to select the right slice.
+                 *
+                 * gif_data from stbi is already laid out as
+                 * [frame0][frame1]...[frameN] contiguously, each
+                 * frame being (width * frame_height * 4) bytes,
+                 * which is exactly the atlas layout we need.
+                 */
+                int frame_height = *out_height;
+                *out_height = frame_height * frames;
+                *out_image_size = (VkDeviceSize)*out_width * *out_height * 4;
+
+                /* stbi already converted GIF centisecond delays to ms */
+                setup_animation_state(data, frames, frame_height, delays);
+                free(delays);
+
+                KROSSHAIR_LOG("[KROSSHAIR] loaded GIF atlas: %dx%d (%d frames, frame_h=%d)\n",
+                              *out_width, *out_height, frames, frame_height);
+        } else if (is_apng || is_png) {
+                /* try to load as APNG; if it's a plain PNG the
+                 * loader will return NULL (no acTL) and we fall
+                 * through to stbi_load below */
+                size_t file_len = 0;
+                unsigned char* file_buf =
+                    read_file_whole(path, "APNG", &file_len);
+
+                int* apng_delays = NULL;
+                int apng_frames = 0;
+                int apng_w = 0, apng_h = 0;
+                unsigned char* apng_data = NULL;
+
+                if (file_buf) {
+                        apng_data = load_apng((const unsigned char*)file_buf,
+                                              (size_t)file_len, &apng_w, &apng_h,
+                                              &apng_frames, &apng_delays);
+                        free(file_buf);
+                }
+
+                if (apng_data && apng_frames > 1) {
+                        /* animated APNG -- same atlas approach as GIF */
+                        *out_width  = apng_w;
+                        int frame_height = apng_h;
+                        *out_height = apng_h * apng_frames;
+                        *out_image_size = (VkDeviceSize)*out_width * *out_height * 4;
+                        *out_pixels = (stbi_uc*)apng_data;
+
+                        setup_animation_state(data, apng_frames,
+                                              frame_height, apng_delays);
+                        free(apng_delays);
+
+                        KROSSHAIR_LOG("[KROSSHAIR] loaded APNG atlas: %dx%d (%d frames, frame_h=%d)\n",
+                                      *out_width, *out_height, apng_frames, frame_height);
+                } else {
+                        /* not animated APNG (or single frame) --
+                         * fall back to regular stbi_load for
+                         * proper PNG handling */
+                        if (apng_data) free(apng_data);
+                        if (apng_delays) free(apng_delays);
+
+                        int tex_channels;
+                        *out_pixels = stbi_load(path, out_width, out_height,
+                                                &tex_channels, STBI_rgb_alpha);
+                        *out_image_size = (VkDeviceSize)*out_width * *out_height * 4;
+                }
+        } else {
+                int tex_channels;
+                *out_pixels = stbi_load(path, out_width, out_height,
+                                        &tex_channels, STBI_rgb_alpha);
+                *out_image_size = (VkDeviceSize)*out_width * *out_height * 4;
+        }
+
+        return *out_pixels != NULL;
+}
+
+/*
  * Make sure this swapchain has an up-to-date crosshair image uploaded.
  *
  * If no image is uploaded yet (or one needs reloading because the path
@@ -437,7 +570,7 @@ static char* get_dynamic_cfg_path(void)
  * cmd_buffer:  command buffer the pixel upload is encoded into.
  */
 void ensure_swapchain_crosshair(swapchain_data_t* data,
-                                        VkCommandBuffer cmd_buffer)
+                                VkCommandBuffer cmd_buffer)
 {
         device_data_t* device_data = data->device_data;
 
@@ -470,136 +603,12 @@ void ensure_swapchain_crosshair(swapchain_data_t* data,
 
         int tex_width;
         int tex_height;
-        int tex_channels;
         VkDeviceSize image_size;
-        stbi_uc* pixels;
+        stbi_uc* pixels = NULL;
 
-        if (using_file) {
-                const char* ext = strrchr(crosshair_path, '.');
-                int is_gif = ext && (strcasecmp(ext, ".gif") == 0);
-                int is_apng = ext && (strcasecmp(ext, ".apng") == 0);
-
-                /* .png files might also be APNG -- detect by checking for
-                 * acTL chunk if the extension is .png */
-                int is_png = ext && (strcasecmp(ext, ".png") == 0);
-
-                if (is_gif) {
-                        size_t file_len = 0;
-                        unsigned char* file_buf =
-                            read_file_whole(crosshair_path, "GIF", &file_len);
-                        if (!file_buf) {
-                                free(crosshair_path);
-                                return;
-                        }
-
-                        int* delays = NULL;
-                        int frames = 0;
-                        stbi_uc* gif_data = stbi_load_gif_from_memory(
-                            file_buf, (int)file_len, &delays, &tex_width,
-                            &tex_height, &frames, &tex_channels, STBI_rgb_alpha);
-                        free(file_buf);
-
-                        if (!gif_data || frames < 1) {
-                                KROSSHAIR_LOG("[KROSSHAIR_ERROR] failed to decode GIF: %s (%s)\n",
-                                              crosshair_path,
-                                              gif_data ? "no frames" : "decode error");
-                                if (gif_data) stbi_image_free(gif_data);
-                                if (delays) free(delays);
-                                free(crosshair_path);
-                                return;
-                        }
-
-                        /*
-                         * Build a vertical texture atlas: all frames stacked
-                         * top-to-bottom in a single image.  The UV coordinates
-                         * are adjusted per-frame to select the right slice.
-                         *
-                         * gif_data from stbi is already laid out as
-                         * [frame0][frame1]...[frameN] contiguously, each
-                         * frame being (tex_width * tex_height * 4) bytes,
-                         * which is exactly the atlas layout we need.
-                         */
-                        int frame_height = tex_height;
-                        int atlas_height = tex_height * frames;
-                        image_size = (VkDeviceSize)tex_width * atlas_height * 4;
-                        pixels = gif_data;
-                        /* tex_height now refers to the full atlas */
-                        tex_height = atlas_height;
-
-                        /* stbi already converted GIF centisecond delays to ms */
-                        setup_animation_state(data, frames, frame_height, delays);
-                        free(delays);
-
-                        KROSSHAIR_LOG("[KROSSHAIR] loaded GIF atlas: %dx%d (%d frames, frame_h=%d)\n",
-                                      tex_width, atlas_height, frames, frame_height);
-                } else if (is_apng || is_png) {
-                        /* try to load as APNG; if it's a plain PNG the
-                         * loader will return NULL (no acTL) and we fall
-                         * through to stbi_load below */
-                        size_t file_len = 0;
-                        unsigned char* file_buf =
-                            read_file_whole(crosshair_path, "APNG", &file_len);
-
-                        int* apng_delays = NULL;
-                        int apng_frames = 0;
-                        int apng_w = 0, apng_h = 0;
-                        unsigned char* apng_data = NULL;
-
-                        if (file_buf) {
-                                apng_data = load_apng((const unsigned char*)file_buf,
-                                                      (size_t)file_len, &apng_w, &apng_h,
-                                                      &apng_frames, &apng_delays);
-                                free(file_buf);
-                        }
-
-                        if (apng_data && apng_frames > 1) {
-                                /* animated APNG -- same atlas approach as GIF */
-                                tex_width = apng_w;
-                                int frame_height = apng_h;
-                                int atlas_height = apng_h * apng_frames;
-                                tex_height = atlas_height;
-                                image_size = (VkDeviceSize)tex_width * atlas_height * 4;
-                                pixels = (stbi_uc*)apng_data;
-
-                                setup_animation_state(data, apng_frames,
-                                                      frame_height, apng_delays);
-                                free(apng_delays);
-
-                                KROSSHAIR_LOG("[KROSSHAIR] loaded APNG atlas: %dx%d (%d frames, frame_h=%d)\n",
-                                              tex_width, atlas_height, apng_frames, frame_height);
-                        } else {
-                                /* not animated APNG (or single frame) --
-                                 * fall back to regular stbi_load for
-                                 * proper PNG handling */
-                                if (apng_data) free(apng_data);
-                                if (apng_delays) free(apng_delays);
-
-                                pixels = stbi_load(crosshair_path, &tex_width, &tex_height,
-                                                   &tex_channels, STBI_rgb_alpha);
-                                image_size = tex_width * tex_height * 4;
-                        }
-                } else {
-                        pixels = stbi_load(crosshair_path, &tex_width, &tex_height,
-                                           &tex_channels, STBI_rgb_alpha);
-                        image_size = tex_width * tex_height * 4;
-                }
-
-                if (!pixels) {
-                        if (!kh_msg_shown_load_fail) {
-                                const char* source = getenv("KROSSHAIR_IMG") ?
-                                        "set via env var 'KROSSHAIR_IMG'" : "at default crosshair location";
-                                fprintf(stderr, "[KH] Cannot load crosshair image '%s' (%s): not a valid image file — falling back to the built-in crosshair\n",
-                                        crosshair_path, source);
-                                kh_msg_shown_load_fail = 1;
-                        }
-                        KROSSHAIR_LOG(
-                            "[KROSSHAIR_ERROR] failed to load crosshair "
-                            "image — falling back to built-in crosshair.\n");
-                        free(crosshair_path);
-                        crosshair_path = NULL;
-                        goto fallback_to_built_in;
-                }
-
+        if (using_file &&
+            decode_crosshair_file(data, crosshair_path, &pixels, &tex_width,
+                                  &tex_height, &image_size)) {
                 data->descriptor_set = create_image_with_desc(
                     data, tex_width, tex_height, VK_FORMAT_R8G8B8A8_SRGB,
                     &data->crosshair_image, &data->crosshair_mem,
@@ -611,10 +620,12 @@ void ensure_swapchain_crosshair(swapchain_data_t* data,
                     &data->crosshair_upload_buffer_mem, data->crosshair_image);
                 stbi_image_free(pixels);
 
+                /* the path's ownership moves to the swapchain so its
+                 * mtime can be watched for hot-reloads */
                 data->crosshair_path = crosshair_path;
-                get_file_mtime(crosshair_path, &data->crosshair_mtime);
+                get_file_mtime(data->crosshair_path, &data->crosshair_mtime);
                 KROSSHAIR_LOG("[KROSSHAIR] loaded crosshair from: %s (mtime %ld.%ld)\n",
-                              crosshair_path,
+                              data->crosshair_path,
                               data->crosshair_mtime.tv_sec,
                               data->crosshair_mtime.tv_nsec);
                 if (!kh_msg_shown_file_load) {
@@ -622,19 +633,32 @@ void ensure_swapchain_crosshair(swapchain_data_t* data,
                                 "Set via env var 'KROSSHAIR_IMG'" :
                                 "Default crosshair location";
                         fprintf(stderr, "[KH] Loading crosshair from file '%s'. Reason: %s\n",
-                                crosshair_path, reason);
+                                data->crosshair_path, reason);
                         kh_msg_shown_file_load = 1;
                 }
         } else {
-                fallback_to_built_in:
+                if (using_file) {
+                        if (!kh_msg_shown_load_fail) {
+                                const char* source = getenv("KROSSHAIR_IMG") ?
+                                        "set via env var 'KROSSHAIR_IMG'" : "at default crosshair location";
+                                fprintf(stderr, "[KH] Cannot load crosshair image '%s' (%s): not a valid image file — falling back to the built-in crosshair\n",
+                                        crosshair_path, source);
+                                kh_msg_shown_load_fail = 1;
+                        }
+                        KROSSHAIR_LOG(
+                            "[KROSSHAIR_ERROR] failed to load crosshair "
+                            "image — falling back to built-in crosshair.\n");
+                }
+                free(crosshair_path);
+
+                /* no usable file — fall back to the built-in crosshair */
                 if (!kh_msg_shown_built_in) {
                         fprintf(stderr, "[KH] Using built-in crosshair. Load a different crosshair by setting env var 'KROSSHAIR_IMG' to a transparent PNG file.\n");
                         kh_msg_shown_built_in = 1;
                 }
-                free(crosshair_path);
                 tex_width            = default_crosshair_width;
                 tex_height           = default_crosshair_height;
-                image_size           = tex_width * tex_height * 4;
+                image_size           = (VkDeviceSize)tex_width * tex_height * 4;
 
                 data->descriptor_set = create_image_with_desc(
                     data, tex_width, tex_height, VK_FORMAT_R8G8B8A8_SRGB,
