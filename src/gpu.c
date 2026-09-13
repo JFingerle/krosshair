@@ -18,15 +18,28 @@
 #include "../include/shaders.h"
 #include "../shaders/dynamic_spv.h"
 
+/*
+ * Find the device memory type index a resource must use.
+ *
+ * device_data: device whose physical-device memory properties are
+ *              queried;
+ * properties:  required VkMemoryPropertyFlags (e.g. host-visible for
+ *              CPU-written buffers, device-local for GPU images) — a
+ *              type must expose every requested flag;
+ * type_bits:   bitmask of memory types the resource may live in
+ *              (VkMemoryRequirements::memoryTypeBits).
+ * Returns the first matching type index, or K_NO_MEMORYTYPE if none
+ * matches.
+ */
 uint32_t vk_memory_type(device_data_t* device_data,
-                               VkMemoryPropertyFlags properties,
-                               uint32_t type_bits)
+                                VkMemoryPropertyFlags properties,
+                                uint32_t type_bits)
 {
-        VkPhysicalDeviceMemoryProperties _properties;
+        VkPhysicalDeviceMemoryProperties mem_props;
         device_data->instance->vtable.GetPhysicalDeviceMemoryProperties(
-            device_data->physical_device, &_properties);
-        for (uint32_t i = 0; i < _properties.memoryTypeCount; i++) {
-                if ((_properties.memoryTypes[i].propertyFlags & properties) ==
+            device_data->physical_device, &mem_props);
+        for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+                if ((mem_props.memoryTypes[i].propertyFlags & properties) ==
                         properties &&
                     type_bits & (1 << i))
                         return i;
@@ -35,6 +48,21 @@ uint32_t vk_memory_type(device_data_t* device_data,
 }
 
 
+/*
+ * (Re)create a host-visible buffer, replacing whatever buffer/memory
+ * currently sits at the given handles (VK_NULL_HANDLE means "none").
+ *
+ * The requested size is rounded up to the device's
+ * nonCoherentAtomSize alignment so CPU writes never bleed into a
+ * neighbouring allocation.
+ *
+ * device_data: device to create the buffer on;
+ * buffer:      in: old buffer to destroy, out: the new one;
+ * buffer_mem:  in: old device memory to free, out: the new one;
+ * buffer_size: set to the (aligned) size of the new buffer;
+ * new_size:    requested size in bytes;
+ * usage:       buffer usage flags (e.g. TRANSFER_SRC, VERTEX).
+ */
 void create_or_resize_buffer(device_data_t* device_data,
                                     VkBuffer* buffer,
                                     VkDeviceMemory* buffer_mem,
@@ -83,6 +111,14 @@ void create_or_resize_buffer(device_data_t* device_data,
 }
 
 
+/*
+ * Tear down one swapchain's crosshair image, upload buffer,
+ * descriptor set and animation state. Used both on crosshair
+ * hot-reload and on full swapchain teardown; handles are nulled so a
+ * second call is a no-op.
+ *
+ * data: swapchain whose crosshair resources are released.
+ */
 void shutdown_krosshair_image(swapchain_data_t* data)
 {
         device_data_t* device_data = data->device_data;
@@ -147,6 +183,13 @@ void shutdown_krosshair_image(swapchain_data_t* data)
         data->crosshair_tex_width = 0;
 }
 
+/*
+ * Tear down one swapchain's dynamic mask image and upload buffer
+ * (the mask descriptor set is freed by the caller). Used on mask
+ * hot-reload and on full swapchain teardown.
+ *
+ * data: swapchain whose mask image resources are released.
+ */
 void shutdown_dynamic_mask(swapchain_data_t* data)
 {
         device_data_t* device_data = data->device_data;
@@ -187,6 +230,14 @@ void shutdown_dynamic_mask(swapchain_data_t* data)
 }
 
 
+/*
+ * Destroy every GPU resource one swapchain owns: its draw ring
+ * slots, descriptor sets, crosshair/mask images, the
+ * shader-pipeline framebuffer-copy image, and the framebuffers and
+ * image views, plus the path strings the swapchain took ownership of.
+ *
+ * data: swapchain to tear down; NULL is a no-op.
+ */
 void destroy_swapchain_data(swapchain_data_t* data)
 {
         if (!data) return;
@@ -248,14 +299,14 @@ void destroy_swapchain_data(swapchain_data_t* data)
         for (uint32_t i = 0; i < data->n_images; i++) {
                 if (data->framebuffers[i] != VK_NULL_HANDLE) {
                         device_data->vtable.DestroyFramebuffer(device_data->device,
-                                                                data->framebuffers[i], NULL);
+                                                              data->framebuffers[i], NULL);
                         data->framebuffers[i] = VK_NULL_HANDLE;
                 }
-                 if (data->image_views[i] != VK_NULL_HANDLE) {
+                if (data->image_views[i] != VK_NULL_HANDLE) {
                         device_data->vtable.DestroyImageView(device_data->device,
-                                                             data->image_views[i], NULL);
+                                                            data->image_views[i], NULL);
                         data->image_views[i] = VK_NULL_HANDLE;
-                 }
+                }
         }
         /* n_images = 0: the framebuffer/view loop above is the last consumer;
          * null it so a hypothetical second call to destroy_swapchain_data on
@@ -276,6 +327,14 @@ void destroy_swapchain_data(swapchain_data_t* data)
         }
 }
 
+/*
+ * Point a combined-image-sampler descriptor set at a (new) image
+ * view — used when a swapchain's crosshair image is (re)created.
+ *
+ * data:        swapchain (the immutable sampler comes from its device);
+ * image_view:  image view to bind;
+ * set:         descriptor set to update in place.
+ */
 static void update_image_descriptor(swapchain_data_t* data,
                                     VkImageView image_view, VkDescriptorSet set)
 {
@@ -296,10 +355,24 @@ static void update_image_descriptor(swapchain_data_t* data,
                                                  &write_desc, 0, NULL);
 }
 
+/*
+ * Create a 2D sampled image in device-local (GPU-only) memory with
+ * its backing memory bound and an image view for sampling. Pixels are
+ * moved in separately via upload_image_data.
+ *
+ * data:           swapchain (the device comes from it);
+ * descriptor_set: if not VK_NULL_HANDLE, its sampler binding is
+ *                 updated to point at the new image view;
+ * width/height:   image size in pixels;
+ * format:         pixel format;
+ * image:          out: the new image;
+ * image_mem:      out: the backing device memory;
+ * image_view:     out: the new image view.
+ */
 void create_image(swapchain_data_t* data, VkDescriptorSet descriptor_set,
-                         uint32_t width, uint32_t height, VkFormat format,
-                         VkImage* image, VkDeviceMemory* image_mem,
-                         VkImageView* image_view)
+                      uint32_t width, uint32_t height, VkFormat format,
+                      VkImage* image, VkDeviceMemory* image_mem,
+                      VkImageView* image_view)
 {
         device_data_t* device_data   = data->device_data;
 
@@ -352,11 +425,21 @@ void create_image(swapchain_data_t* data, VkDescriptorSet descriptor_set,
         }
 }
 
+/*
+ * Allocate one descriptor set from the device-scoped main pool, then
+ * create the image + view wired to that set.
+ *
+ * data:           swapchain (pool and set layout come from its device);
+ * width/height:   image size in pixels;
+ * format:         pixel format;
+ * image/image_mem/image_view: out parameters.
+ * Returns the allocated descriptor set.
+ */
 VkDescriptorSet create_image_with_desc(swapchain_data_t* data,
-                                              uint32_t width, uint32_t height,
-                                              VkFormat format, VkImage* image,
-                                              VkDeviceMemory* image_mem,
-                                              VkImageView* image_view)
+                                          uint32_t width, uint32_t height,
+                                          VkFormat format, VkImage* image,
+                                          VkDeviceMemory* image_mem,
+                                          VkImageView* image_view)
 {
         device_data_t* device_data             = data->device_data;
 
@@ -378,6 +461,19 @@ VkDescriptorSet create_image_with_desc(swapchain_data_t* data,
         return descriptor_set;
 }
 
+/*
+ * (Re)create a host-visible TRANSFER_SRC upload buffer of exactly
+ * new_size bytes, replacing whatever buffer/memory currently sits at
+ * the given handles.
+ *
+ * Each swapchain owns its own upload buffers (crosshair, mask, quad),
+ * so one is (re)created per upload instead of being grown in place.
+ *
+ * device_data:        device to create the buffer on;
+ * upload_buffer:      in: old buffer to destroy, out: the new one;
+ * upload_buffer_mem:  in: old memory to free, out: the new one;
+ * new_size:           requested size in bytes.
+ */
 static void create_or_resize_upload_buffer(device_data_t* device_data,
                                           VkBuffer* upload_buffer,
                                           VkDeviceMemory* upload_buffer_mem,
@@ -418,21 +514,77 @@ static void create_or_resize_upload_buffer(device_data_t* device_data,
             device_data->device, *upload_buffer, *upload_buffer_mem, 0));
 }
 
+/*
+ * Record a layout transition for a single 2D image: a pipeline
+ * barrier moving the image from old_layout to new_layout, paired with
+ * the stage/access masks that produced and consume the data.
+ *
+ * device_data: device + vtable;
+ * cmd_buffer:  command buffer the barrier is encoded into;
+ * image:       image to transition;
+ * src_stage/src_access: stage/access that last touched the image
+ *           (0,0 when it has never been used, e.g. UNDEFINED layout);
+ * dst_stage/dst_access: stage/access that will next use it;
+ * old_layout/new_layout: image layout before/after the transition.
+ */
+static void transition_image_layout(device_data_t* device_data,
+                                    VkCommandBuffer cmd_buffer,
+                                    VkImage image,
+                                    VkPipelineStageFlagBits src_stage,
+                                    VkAccessFlagBits src_access,
+                                    VkPipelineStageFlagBits dst_stage,
+                                    VkAccessFlagBits dst_access,
+                                    VkImageLayout old_layout,
+                                    VkImageLayout new_layout)
+{
+        VkImageMemoryBarrier barrier = {};
+        barrier.sType             = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.image             = image;
+        barrier.oldLayout         = old_layout;
+        barrier.newLayout         = new_layout;
+        barrier.srcAccessMask     = src_access;
+        barrier.dstAccessMask     = dst_access;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.layerCount = 1;
+        device_data->vtable.CmdPipelineBarrier(
+            cmd_buffer, src_stage, dst_stage, 0, 0, NULL, 0, NULL, 1,
+            &barrier);
+}
+
+/*
+ * Upload raw pixels into an image: write them into a host-visible
+ * upload buffer, then encode a buffer-to-image copy with the
+ * surrounding layout barriers into cmd_buffer.
+ *
+ * device_data:      device + vtable;
+ * cmd_buffer:       command buffer the copy and barriers are encoded
+ *                   into;
+ * pixels:           source pixel data;
+ * upload_size:      size of pixels in bytes (width*height*4);
+ * width/height:     image size in pixels;
+ * upload_buffer/upload_buffer_mem: per-swapchain upload buffer handles —
+ *                   recreated at upload_size as needed;
+ * image:            destination image (starts UNDEFINED, ends
+ *                   SHADER_READ_ONLY_OPTIMAL).
+ */
 void upload_image_data(device_data_t* device_data,
-                              VkCommandBuffer cmd_buffer, void* pixels,
-                              VkDeviceSize upload_size, uint32_t width,
-                              uint32_t height, VkBuffer* upload_buffer,
-                              VkDeviceMemory* upload_buffer_mem, VkImage image)
+                          VkCommandBuffer cmd_buffer, void* pixels,
+                          VkDeviceSize upload_size, uint32_t width,
+                          uint32_t height, VkBuffer* upload_buffer,
+                          VkDeviceMemory* upload_buffer_mem, VkImage image)
 {
         /* always create the upload buffer - each swapchain has its own */
         create_or_resize_upload_buffer(device_data, upload_buffer,
                                        upload_buffer_mem, upload_size);
 
-        char* map = NULL;
+        char* mapped = NULL;
         VK_CHECK(device_data->vtable.MapMemory(device_data->device,
-                                               *upload_buffer_mem, 0,
-                                               upload_size, 0, (void**)(&map)));
-        memcpy(map, pixels, upload_size);
+                                                *upload_buffer_mem, 0,
+                                                upload_size, 0, (void**)(&mapped)));
+        memcpy(mapped, pixels, upload_size);
         VkMappedMemoryRange range = {};
         range.sType               = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
         range.memory              = *upload_buffer_mem;
@@ -442,21 +594,14 @@ void upload_image_data(device_data_t* device_data,
         device_data->vtable.UnmapMemory(device_data->device,
                                         *upload_buffer_mem);
 
-        VkImageMemoryBarrier copy_barrier = {};
-        copy_barrier.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        copy_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        copy_barrier.oldLayout     = VK_IMAGE_LAYOUT_UNDEFINED;
-        copy_barrier.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        copy_barrier.srcQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED;
-        copy_barrier.dstQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED;
-        copy_barrier.image                       = image;
-        copy_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        copy_barrier.subresourceRange.levelCount = 1;
-        copy_barrier.subresourceRange.layerCount = 1;
-        device_data->vtable.CmdPipelineBarrier(
-            cmd_buffer, VK_PIPELINE_STAGE_HOST_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
-            &copy_barrier);
+        /* UNDEFINED -> TRANSFER_DST: make the image the target of the
+         * host -> device pixel copy */
+        transition_image_layout(device_data, cmd_buffer, image,
+                                VK_PIPELINE_STAGE_HOST_BIT, 0,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_ACCESS_TRANSFER_WRITE_BIT,
+                                VK_IMAGE_LAYOUT_UNDEFINED,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
         VkBufferImageCopy region           = {};
         region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -468,26 +613,94 @@ void upload_image_data(device_data_t* device_data,
             cmd_buffer, *upload_buffer, image,
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-        VkImageMemoryBarrier use_barrier = {};
-        use_barrier.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        use_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        use_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        use_barrier.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        use_barrier.newLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        use_barrier.srcQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED;
-        use_barrier.dstQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED;
-        use_barrier.image                       = image;
-        use_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        use_barrier.subresourceRange.levelCount = 1;
-        use_barrier.subresourceRange.layerCount = 1;
-        device_data->vtable.CmdPipelineBarrier(
-            cmd_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1,
-            &use_barrier);
+        /* TRANSFER_DST -> SHADER_READ_ONLY: make the copied pixels
+         * visible to the fragment shader */
+        transition_image_layout(device_data, cmd_buffer, image,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_ACCESS_TRANSFER_WRITE_BIT,
+                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                VK_ACCESS_SHADER_READ_BIT,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+
+/*
+ * Create the descriptor/pipeline resources for the shader-based
+ * dynamic pipeline (Complement, LumaInvert, ...): its descriptor set
+ * layout (binding 0 = mask, binding 1 = game framebuffer), its
+ * pipeline layout (exposing the dynamic push constants), and its
+ * descriptor pool.
+ *
+ * device_data: device to create the resources on;
+ * sampler:     crosshair sampler to pin as immutable sampler in both
+ *              bindings.
+ */
+static void create_shader_desc_resources(device_data_t* device_data,
+                                          VkSampler sampler)
+{
+        /* descriptor set layout: binding 0 = mask, binding 1 = game FB */
+        VkDescriptorSetLayoutBinding shader_bindings[2] = {};
+        shader_bindings[0].binding         = 0;
+        shader_bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        shader_bindings[0].descriptorCount = 1;
+        shader_bindings[0].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+        shader_bindings[0].pImmutableSamplers = &sampler;
+        shader_bindings[1].binding         = 1;
+        shader_bindings[1].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        shader_bindings[1].descriptorCount = 1;
+        shader_bindings[1].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+        shader_bindings[1].pImmutableSamplers = &sampler;
+
+        VkDescriptorSetLayoutCreateInfo sdl_info = {};
+        sdl_info.sType =
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        sdl_info.bindingCount = 2;
+        sdl_info.pBindings    = shader_bindings;
+        VK_CHECK(device_data->vtable.CreateDescriptorSetLayout(
+            device_data->device, &sdl_info, NULL,
+            &device_data->shader_desc_layout));
+
+        /* push constant range: full dynamic_push_constants (80 bytes) */
+        VkPushConstantRange pc_range = {};
+        pc_range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        pc_range.offset     = 0;
+        pc_range.size       = sizeof(struct dynamic_push_constants);
+
+        VkPipelineLayoutCreateInfo spl_info = {};
+        spl_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        spl_info.setLayoutCount         = 1;
+        spl_info.pSetLayouts            = &device_data->shader_desc_layout;
+        spl_info.pushConstantRangeCount = 1;
+        spl_info.pPushConstantRanges    = &pc_range;
+        VK_CHECK(device_data->vtable.CreatePipelineLayout(
+            device_data->device, &spl_info, NULL,
+            &device_data->shader_pipeline_layout));
+
+        /* descriptor pool for shader dynamic desc set */
+        VkDescriptorPoolSize sp_size = {};
+        sp_size.type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        sp_size.descriptorCount =
+            2 * KROSSHAIR_MAX_SWAPCHAINS; /* 2 bindings: mask + game_fb */
+
+        VkDescriptorPoolCreateInfo sp_info = {};
+        sp_info.sType   = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        sp_info.maxSets = KROSSHAIR_MAX_SWAPCHAINS; /* one set per
+                                                     concurrent swapchain */
+        sp_info.poolSizeCount = 1;
+        sp_info.pPoolSizes    = &sp_size;
+        VK_CHECK(device_data->vtable.CreateDescriptorPool(
+            device_data->device, &sp_info, NULL,
+            &device_data->shader_desc_pool));
 }
 
-// malloc's returned string, free later
-
+/*
+ * Create the device-scoped resources that outlive any swapchain: the
+ * crosshair sampler, the main descriptor pool/set-layout/pipeline
+ * layout, the shader-based dynamic pipeline's descriptor resources
+ * (see create_shader_desc_resources), and the command pool.
+ *
+ * device_data: device to create the resources on.
+ */
 void create_device_stable_resources(device_data_t* device_data)
 {
         VkSamplerCreateInfo sampler_info = {};
@@ -544,65 +757,8 @@ void create_device_stable_resources(device_data_t* device_data)
         VK_CHECK(device_data->vtable.CreatePipelineLayout(
             device_data->device, &layout_info, NULL, &device_data->pipeline_layout));
 
-        /* ═══════════════════════════════════════════════════════════
-         * Shader-based dynamic pipeline (Complement, LumaInvert, etc.)
-         * Uses a custom fragment shader that reads the game framebuffer.
-         * ═══════════════════════════════════════════════════════════ */
-        {
-                /* descriptor set layout: binding 0 = mask, binding 1 = game FB */
-                VkDescriptorSetLayoutBinding shader_bindings[2] = {};
-                shader_bindings[0].binding         = 0;
-                shader_bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                shader_bindings[0].descriptorCount = 1;
-                shader_bindings[0].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
-                shader_bindings[0].pImmutableSamplers = &sampler;
-                shader_bindings[1].binding         = 1;
-                shader_bindings[1].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                shader_bindings[1].descriptorCount = 1;
-                shader_bindings[1].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
-                shader_bindings[1].pImmutableSamplers = &sampler;
-
-                VkDescriptorSetLayoutCreateInfo sdl_info = {};
-                sdl_info.sType =
-                    VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-                sdl_info.bindingCount = 2;
-                sdl_info.pBindings    = shader_bindings;
-                VK_CHECK(device_data->vtable.CreateDescriptorSetLayout(
-                    device_data->device, &sdl_info, NULL,
-                    &device_data->shader_desc_layout));
-
-                /* push constant range: full dynamic_push_constants (80 bytes) */
-                VkPushConstantRange pc_range = {};
-                pc_range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-                pc_range.offset     = 0;
-                pc_range.size       = sizeof(struct dynamic_push_constants);
-
-                VkPipelineLayoutCreateInfo spl_info = {};
-                spl_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-                spl_info.setLayoutCount         = 1;
-                spl_info.pSetLayouts            = &device_data->shader_desc_layout;
-                spl_info.pushConstantRangeCount = 1;
-                spl_info.pPushConstantRanges    = &pc_range;
-                VK_CHECK(device_data->vtable.CreatePipelineLayout(
-                    device_data->device, &spl_info, NULL,
-                    &device_data->shader_pipeline_layout));
-
-                /* descriptor pool for shader dynamic desc set */
-                VkDescriptorPoolSize sp_size = {};
-                sp_size.type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                sp_size.descriptorCount =
-                    2 * KROSSHAIR_MAX_SWAPCHAINS; /* 2 bindings: mask + game_fb */
-
-                VkDescriptorPoolCreateInfo sp_info = {};
-                sp_info.sType   = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-                 sp_info.maxSets = KROSSHAIR_MAX_SWAPCHAINS; /* one set per
-                                                              concurrent swapchain */
-                sp_info.poolSizeCount = 1;
-                sp_info.pPoolSizes    = &sp_size;
-                VK_CHECK(device_data->vtable.CreateDescriptorPool(
-                    device_data->device, &sp_info, NULL,
-                    &device_data->shader_desc_pool));
-        }
+        /* shader-based dynamic pipeline descriptor resources */
+        create_shader_desc_resources(device_data, sampler);
 
         VkCommandPoolCreateInfo cmd_buffer_pool_info = {};
         cmd_buffer_pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -613,6 +769,30 @@ void create_device_stable_resources(device_data_t* device_data)
         VK_CHECK(device_data->vtable.CreateCommandPool(
             device_data->device, &cmd_buffer_pool_info, NULL,
             &device_data->cmd_pool));
+}
+
+/*
+ * Wrap compiled SPIR-V in a VkShaderModule. The module is only needed
+ * while the pipeline that consumes it is being built — the caller
+ * destroys it right after CreateGraphicsPipelines.
+ *
+ * device_data: device to create the module on;
+ * code:        compiled SPIR-V words;
+ * code_size:   its size in bytes.
+ * Returns the new shader module.
+ */
+static VkShaderModule create_shader_module(device_data_t* device_data,
+                                            const uint32_t* code,
+                                            size_t code_size)
+{
+        VkShaderModuleCreateInfo module_info = {};
+        module_info.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        module_info.codeSize = code_size;
+        module_info.pCode    = code;
+        VkShaderModule module;
+        VK_CHECK(device_data->vtable.CreateShaderModule(
+            device_data->device, &module_info, NULL, &module));
+        return module;
 }
 
 /*
@@ -665,22 +845,10 @@ static void create_format_resources(device_data_t* device_data)
             device_data->device, &render_pass_info, NULL,
             &device_data->render_pass));
 
-        VkShaderModule vert_module;
-        VkShaderModule frag_module;
-
-        VkShaderModuleCreateInfo vert_info = {};
-        vert_info.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        vert_info.codeSize = sizeof(vert_spv);
-        vert_info.pCode    = (const uint32_t*)vert_spv;
-        VK_CHECK(device_data->vtable.CreateShaderModule(
-            device_data->device, &vert_info, NULL, &vert_module));
-
-        VkShaderModuleCreateInfo frag_info = {};
-        frag_info.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        frag_info.codeSize = sizeof(frag_spv);
-        frag_info.pCode    = (const uint32_t*)frag_spv;
-        VK_CHECK(device_data->vtable.CreateShaderModule(
-            device_data->device, &frag_info, NULL, &frag_module));
+        VkShaderModule vert_module =
+            create_shader_module(device_data, vert_spv, sizeof(vert_spv));
+        VkShaderModule frag_module =
+            create_shader_module(device_data, frag_spv, sizeof(frag_spv));
 
         VkPipelineShaderStageCreateInfo stage[2] = {};
         stage[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -806,21 +974,10 @@ static void create_format_resources(device_data_t* device_data)
          * Uses a custom fragment shader that reads the game framebuffer.
          * ═══════════════════════════════════════════════════════════ */
         {
-                VkShaderModule dyn_vert_mod, dyn_frag_mod;
-
-                VkShaderModuleCreateInfo dvi = {};
-                dvi.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-                dvi.codeSize = sizeof(dynamic_vert_spv);
-                dvi.pCode    = (const uint32_t*)dynamic_vert_spv;
-                VK_CHECK(device_data->vtable.CreateShaderModule(
-                    device_data->device, &dvi, NULL, &dyn_vert_mod));
-
-                VkShaderModuleCreateInfo dfi = {};
-                dfi.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-                dfi.codeSize = sizeof(dynamic_frag_spv);
-                dfi.pCode    = (const uint32_t*)dynamic_frag_spv;
-                VK_CHECK(device_data->vtable.CreateShaderModule(
-                    device_data->device, &dfi, NULL, &dyn_frag_mod));
+                VkShaderModule dyn_vert_mod = create_shader_module(
+                    device_data, dynamic_vert_spv, sizeof(dynamic_vert_spv));
+                VkShaderModule dyn_frag_mod = create_shader_module(
+                    device_data, dynamic_frag_spv, sizeof(dynamic_frag_spv));
 
                 /* desc layout + pool are device-scoped (created in
                  * create_device_stable_resources) */
@@ -914,8 +1071,18 @@ static void ensure_format_resources(device_data_t* device_data, VkFormat format)
         create_format_resources(device_data);
 }
 
+/*
+ * (Re)build the per-swapchain resources for a newly created swapchain:
+ * one image view and one framebuffer per swapchain image (all
+ * referencing the format-scoped render pass), plus the per-image draw
+ * ring slots.
+ *
+ * data:         swapchain whose swapchain handle is already set; width,
+ *               height and format are filled from pCreateInfo;
+ * pCreateInfo:  the swapchain creation parameters the app passed in.
+ */
 void setup_swapchain_data(swapchain_data_t* data,
-                                 const VkSwapchainCreateInfoKHR* pCreateInfo)
+                                  const VkSwapchainCreateInfoKHR* pCreateInfo)
 {
         device_data_t* device_data = data->device_data;
         data->width                = pCreateInfo->imageExtent.width;
