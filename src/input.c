@@ -381,5 +381,5 @@ static void kh_input_init_once(void)
  */
 void init_input_thread(void)
 {
-	pthread_once(&kh_input_once, kh_input_init_once);
+        pthread_once(&kh_input_once, kh_input_init_once);
 }
