@@ -80,6 +80,8 @@ jobs:
       - name: Enable Flathub remote
         run: |
           flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+      - name: Run tests
+        run: make test
       - name: Build binary
         run: make release
       - name: Build flatpak
