@@ -34,6 +34,17 @@
 #include "../include/keys.h"
 #include "../include/krosshair.h"
 
+/*
+ * UNIT_TEST build: expose the lookup table and the intercepted entry
+ * points so the tests/test_*.c binaries can drive them directly
+ * (see tests/test_layer_api.h). Release builds keep them static.
+ */
+#ifdef UNIT_TEST
+#define LAYER_API
+#else
+#define LAYER_API static
+#endif
+
 /* Lock serializing access to the global object map (vk_obj_map). */
 pthread_mutex_t global_lock;
 
@@ -285,7 +296,7 @@ static void overlay_DestroySwapchainKHR(VkDevice device,
  * real instance below us, then loads the instance-level dispatch table
  * and registers all physical devices in the object map.
  */
-static VkResult overlay_CreateInstance(const VkInstanceCreateInfo* create_info,
+LAYER_API VkResult overlay_CreateInstance(const VkInstanceCreateInfo* create_info,
                                        const VkAllocationCallbacks* allocator,
                                        VkInstance* instance_out)
 {
@@ -356,7 +367,7 @@ static VkLayerDeviceCreateInfo* get_device_chain_info(
  * table, queue registry, device properties and the stable GPU resources
  * (sampler, descriptor pools, command pool, pipeline layouts).
  */
-static VkResult overlay_CreateDevice(VkPhysicalDevice physical_device,
+LAYER_API VkResult overlay_CreateDevice(VkPhysicalDevice physical_device,
                                      const VkDeviceCreateInfo* create_info,
                                      const VkAllocationCallbacks* allocator,
                                      VkDevice* device_out)
@@ -532,7 +543,7 @@ static VkResult overlay_AllocateCommandBuffers(
  * pool, layouts, render pass, pipelines) are reclaimed by the driver when
  * the underlying device is destroyed, so they are not freed explicitly.
  */
-static void overlay_DestroyDevice(VkDevice device,
+LAYER_API void overlay_DestroyDevice(VkDevice device,
                                   const VkAllocationCallbacks* allocator)
 {
         device_data_t* device_data = FIND_OBJ(device_data_t, device);
@@ -583,7 +594,7 @@ static void overlay_DestroyDevice(VkDevice device,
         if (chain_destroy) {
                 chain_destroy(device, allocator);
         }
-}
+    }
 
 /*
  * Intercepted vkDestroyInstance.
@@ -595,7 +606,7 @@ static void overlay_DestroyDevice(VkDevice device,
  * names) and the instance entry itself, then forwards the destroy call
  * down the layer chain.
  */
-static void overlay_DestroyInstance(VkInstance instance,
+LAYER_API void overlay_DestroyInstance(VkInstance instance,
                                     const VkAllocationCallbacks* allocator)
 {
         instance_data_t* instance_data = FIND_OBJ(instance_data_t, instance);
@@ -650,7 +661,7 @@ name_to_funcptr_t name_to_funcptr_map[] = {
     {"AllocateCommandBuffers", (void*)overlay_AllocateCommandBuffers}
 };
 
-static size_t name_to_funcptr_map_count =
+LAYER_API size_t name_to_funcptr_map_count =
     (sizeof(name_to_funcptr_map) / sizeof(name_to_funcptr_map[0]));
 
 /*
@@ -661,7 +672,7 @@ static size_t name_to_funcptr_map_count =
  * Returns the overriding function, or NULL to fall through to the next
  * layer / driver.
  */
-static void* find_ptr(const char* name)
+LAYER_API void* find_ptr(const char* name)
 {
         for (uint32_t i = 0; i < name_to_funcptr_map_count; i++) {
                 if (!strcmp(name, name_to_funcptr_map[i].name)) {

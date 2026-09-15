@@ -11,6 +11,15 @@ CCFLAGS += -ggdb
 endif
 
 SOURCES = $(shell find src -type f -name "*.c")
+# test_mock_icd.c is a standalone app linked against libvulkan (it runs
+# through the real loader), not a unit test compiled with the layer sources.
+TEST_SOURCES = $(filter-out tests/test_mock_icd.c,$(wildcard tests/test_*.c))
+MOCK_ICD_DIR = $(BUILD_DIR)/mock_icd
+MOCK_ICD_SO  = $(MOCK_ICD_DIR)/libmock_icd.so
+
+# Test builds link the whole layer with UNIT_TEST defined, which exports a
+# few internal symbols (see tests/test_layer_api.h).
+TEST_CCFLAGS = -Wall -std=c99 -ggdb -DUNIT_TEST -I./include/ -I./tests
 
 BUILD_DIR = build
 FLATPAK_BUILD_DIR = $(BUILD_DIR)/flatpak
@@ -35,7 +44,7 @@ else
 endif
 
 
-.PHONY: all release clean install flatpak-build flatpak-install
+.PHONY: all release test clean install flatpak-build flatpak-install
 
 all:
 	mkdir -p lib
@@ -43,6 +52,40 @@ all:
 
 release:
 	$(MAKE) RELEASE=1 all
+
+# Build every tests/test_*.c against all layer sources (with UNIT_TEST
+# defined) and run each resulting binary. Fails on the first error.
+test: all
+	mkdir -p $(BUILD_DIR)
+	@for t in $(TEST_SOURCES); do \
+		name=$$(basename $$t .c); \
+		echo "== building test $$name"; \
+		$(CC) $(TEST_CCFLAGS) $$t $(SOURCES) -o $(BUILD_DIR)/$$name -lm -lpthread || exit 1; \
+	done
+	@for b in $(BUILD_DIR)/test_*; do \
+		[ "$$b" = "$(BUILD_DIR)/test_mock_icd" ] && continue; \
+		echo "== running $$b"; \
+		$$b || exit 1; \
+	done
+
+	# angle 2: end-to-end through the real Vulkan loader, with the mock
+	# ICD as the only driver and the layer enabled via KROSSHAIR=1.
+	# The test layer manifest is generated with an absolute library_path
+	# (the checked-in krosshair.json points at the install location).
+	echo "== building mock ICD"
+	@mkdir -p $(MOCK_ICD_DIR)
+	# The loader dlopens library_path verbatim (no CWD/manifest-dir
+	# resolution), so the ICD manifest must carry an absolute path.
+	@printf '{\n  "file_format_version": "1.0.0",\n  "ICD": {\n    "library_path": "%s",\n    "api_version": "1_3_0",\n    "name": "VK_ICD_MOCK"\n  }\n}\n' $(CURDIR)/$(MOCK_ICD_SO) > $(MOCK_ICD_DIR)/mock_icd.json
+	$(CC) -Wall -std=c99 -ggdb -fPIC -shared tests/mock_icd.c -o $(MOCK_ICD_SO) || exit 1
+	$(CC) $(TEST_CCFLAGS) tests/test_mock_icd.c -o $(BUILD_DIR)/test_mock_icd -lvulkan -ldl -lm -lpthread || exit 1
+	@mkdir -p $(BUILD_DIR)/vk_layer_path
+	@printf '{\n "file_format_version": "1.0.0",\n "layer": {\n  "name": "VK_LAYER_KROSSHAIR_overlay",\n  "type": "GLOBAL",\n  "api_version": "1.3.0",\n  "library_path": "%s/lib/krosshair.so",\n  "implementation_version": "1",\n  "description": "Crosshair Overlay (test manifest)",\n  "functions": {\n   "vkGetInstanceProcAddr": "overlay_GetInstanceProcAddr",\n   "vkGetDeviceProcAddr": "overlay_GetDeviceProcAddr"\n  },\n  "enable_environment": { "KROSSHAIR": "1" },\n  "disable_environment": { "DISABLE_KROSSHAIR": "1" }\n }\n}\n' $(CURDIR) > $(BUILD_DIR)/vk_layer_path/krosshair.json
+	echo "== running $(BUILD_DIR)/test_mock_icd (layer over mock ICD)"
+	# Some packaged loaders (Debian 1.4.309, Arch 1.4.357) silently skip
+	# layers found via VK_LAYER_PATH, so the manifest is also placed in
+	# the standard per-user implicit layer dir and removed afterwards.
+	@mkdir -p "$(HOME)/.config/vulkan/implicit_layer.d" && cp $(BUILD_DIR)/vk_layer_path/krosshair.json "$(HOME)/.config/vulkan/implicit_layer.d/" && { VK_LAYER_PATH=$(BUILD_DIR)/vk_layer_path VK_DRIVER_FILES=$(MOCK_ICD_DIR)/mock_icd.json KROSSHAIR=1 MOCK_ICD_SO=$(CURDIR)/$(MOCK_ICD_SO) $(BUILD_DIR)/test_mock_icd; rc=$$?; rm -f "$(HOME)/.config/vulkan/implicit_layer.d/krosshair.json"; exit $$rc; }
 
 install:
 	sudo mkdir -p /usr/lib/krosshair
