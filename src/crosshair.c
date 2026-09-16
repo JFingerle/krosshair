@@ -26,13 +26,23 @@
 #include "../include/krosshair.h"
 
 /*
+ * UNIT_TEST build: expose the pure (device-independent) helpers so the
+ * unit tests in tests/test_crosshair.c can call them directly.
+ */
+#ifdef UNIT_TEST
+#define CROSSHAIR_API
+#else
+#define CROSSHAIR_API static
+#endif
+
+/*
  * Reset dynamic push constants to safe defaults: every effect off,
  * identity colors, opacity 1. quad_ndc_min/size are left untouched —
  * the caller sets those from the canvas geometry.
  *
  * pc: push-constants struct written in place.
  */
-static void reset_dynamic_push_constants(struct dynamic_push_constants* pc)
+CROSSHAIR_API void reset_dynamic_push_constants(struct dynamic_push_constants* pc)
 {
         pc->invert_str      = 0.0f;
         pc->dodge_str       = 0.0f;
@@ -60,7 +70,7 @@ static void reset_dynamic_push_constants(struct dynamic_push_constants* pc)
  * Each line is "name a1 [a2 a3 a4]"; unknown names, short lines, and
  * '#' comments are ignored.
  */
-static void parse_dynamic_cfg(const char* path, struct dynamic_push_constants* pc)
+CROSSHAIR_API void parse_dynamic_cfg(const char* path, struct dynamic_push_constants* pc)
 {
         reset_dynamic_push_constants(pc);
 
@@ -175,7 +185,7 @@ uint16_t indices[] = {0, 1, 2, 2, 3, 0};
  * path: path from $KROSSHAIR_IMG (must be non-NULL).
  * Returns a malloc'd copy (caller frees), or NULL if HOME is unset.
  */
-static char* get_crosshair_file(const char* path)
+CROSSHAIR_API char* get_crosshair_file(const char* path)
 {
         if (!path) return NULL;
 
@@ -200,7 +210,7 @@ static char* get_crosshair_file(const char* path)
  * mtime: set to the file's mtime on success.
  * Returns 0 on success, -1 if stat() fails (e.g. file missing).
  */
-static int get_file_mtime(const char* path, struct timespec* mtime)
+CROSSHAIR_API int get_file_mtime(const char* path, struct timespec* mtime)
 {
         struct stat st;
         if (stat(path, &st) != 0) return -1;
@@ -220,7 +230,7 @@ static int get_file_mtime(const char* path, struct timespec* mtime)
  * Returns the buffer (caller frees), or NULL on open/size/alloc/short-
  * read failure (each failure is logged).
  */
-static unsigned char* read_file_whole(const char* path, const char* kind,
+CROSSHAIR_API unsigned char* read_file_whole(const char* path, const char* kind,
                                       size_t* len)
 {
         FILE* f = fopen(path, "rb");
@@ -273,7 +283,7 @@ static unsigned char* read_file_whole(const char* path, const char* kind,
  * log_changes:     log when the path or mtime changed.
  * Returns 1 if the file moved or its mtime changed, 0 otherwise.
  */
-static int image_file_changed(const char* current_path,
+CROSSHAIR_API int image_file_changed(const char* current_path,
                               const struct timespec* current_mtime,
                               const char* new_path,
                               const char* label, int log_changes)
@@ -314,7 +324,7 @@ static int image_file_changed(const char* current_path,
  * Non-positive delays become 100 ms ("as fast as possible" in both
  * source formats is clamped to a sane tick).
  */
-static void setup_animation_state(swapchain_data_t* data, int frame_count,
+CROSSHAIR_API void setup_animation_state(swapchain_data_t* data, int frame_count,
                                   int frame_height, const int* delays_ms)
 {
         data->anim_frame_count   = frame_count;
@@ -339,7 +349,7 @@ static void setup_animation_state(swapchain_data_t* data, int frame_count,
  * Returns a malloc'd path (caller frees), or NULL if no source exists
  * (caller then falls back to the built-in crosshair).
  */
-static char* get_crosshair_path(void)
+CROSSHAIR_API char* get_crosshair_path(void)
 {
         const char* explicit = getenv("KROSSHAIR_IMG");
         if (explicit)
@@ -378,7 +388,7 @@ static char* get_crosshair_path(void)
  * Returns a malloc'd path (caller frees), or NULL if the file does not
  * exist or HOME is unset.
  */
-static char* get_dynamic_mask_path(void)
+CROSSHAIR_API char* get_dynamic_mask_path(void)
 {
         const char* home = getenv("HOME");
         if (!home) return NULL;
@@ -402,7 +412,7 @@ static char* get_dynamic_mask_path(void)
  * Returns a malloc'd path (caller frees), or NULL if the file does not
  * exist or HOME is unset.
  */
-static char* get_dynamic_cfg_path(void)
+CROSSHAIR_API char* get_dynamic_cfg_path(void)
 {
         const char* home = getenv("HOME");
         if (!home) return NULL;
@@ -441,7 +451,7 @@ static char* get_dynamic_cfg_path(void)
  *
  * Returns 1 if a valid image was decoded, 0 on failure (already logged).
  */
-static int decode_crosshair_file(swapchain_data_t* data, const char* path,
+CROSSHAIR_API int decode_crosshair_file(swapchain_data_t* data, const char* path,
                                  stbi_uc** out_pixels, int* out_width,
                                  int* out_height, VkDeviceSize* out_image_size)
 {
