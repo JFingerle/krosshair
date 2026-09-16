@@ -25,6 +25,17 @@
 #include "../include/keys.h"
 #include "../include/krosshair.h"
 
+/*
+ * UNIT_TEST build: expose the pure hotkey/combo logic so
+ * tests/test_input.c can drive it directly. Release builds
+ * keep it static.
+ */
+#ifdef UNIT_TEST
+#define INPUT_API
+#else
+#define INPUT_API static
+#endif
+
 /* 1 while the crosshair overlay is visible (toggled by the hotkey). */
 volatile int crosshair_visible = 1;
 
@@ -51,7 +62,7 @@ static struct timespec kh_combo_down_ts; /* CLOCK_MONOTONIC moment the combo fir
 static pthread_once_t kh_input_once;
 
 /* Returns the bit index (0..count-1) of `code` within the required-key list, or -1. */
-static int kh_key_index(int code)
+INPUT_API int kh_key_index(int code)
 {
     for (int i = 0; i < kh_required_key_count; ++i)
         if (kh_required_keys[i] == code)
@@ -67,7 +78,7 @@ static int kh_key_index(int code)
  * and duplicate tokens are skipped; if nothing remains, the default
  * combo is used.
  */
-static void parse_hotkey(void)
+INPUT_API void parse_hotkey(void)
 {
     const char* hotkey = getenv("KROSSHAIR_HOTKEY_TOGGLE");
     if (!hotkey || hotkey[0] == '\0')
@@ -98,9 +109,19 @@ static void parse_hotkey(void)
             if (code < 0) {
                 KROSSHAIR_LOG("[KROSSHAIR] unknown hotkey token '%s', skipping\n", token);
             } else {
-                int bit = kh_key_index(code);
-                if (bit < 0 && count < KROSSHAIR_MAX_KEYS)
-                    kh_required_keys[count++] = code;
+            /*
+             * Check the list being built (not the global counter, which
+             * only updates at the end of the parse).
+             */
+            int dup = 0;
+            for (int i = 0; i < count; ++i) {
+                if (kh_required_keys[i] == code) {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (!dup && count < KROSSHAIR_MAX_KEYS)
+                kh_required_keys[count++] = code;
             }
         }
         token = strtok(NULL, "+");
@@ -161,7 +182,7 @@ static int scan_devices(void)
 }
 
 /* Applies a single EV_KEY event to the required-keys bitmask. */
-static void kh_apply_event(const struct input_event* ev)
+INPUT_API void kh_apply_event(const struct input_event* ev)
 {
     if (ev->type != EV_KEY)
         return;
@@ -196,7 +217,7 @@ static void kh_resync_state(void)
 }
 
 /* Milliseconds elapsed between two CLOCK_MONOTONIC timestamps. */
-static long kh_elapsed_ms(const struct timespec* start, const struct timespec* now)
+INPUT_API long kh_elapsed_ms(const struct timespec* start, const struct timespec* now)
 {
     return (now->tv_sec - start->tv_sec) * 1000 +
            (now->tv_nsec - start->tv_nsec) / 1000000;
@@ -209,7 +230,7 @@ static long kh_elapsed_ms(const struct timespec* start, const struct timespec* n
  * fired, wake exactly at the hold boundary even though held keys emit no
  * new events. No busy-wait.
  */
-static long kh_select_timeout_ms(void)
+INPUT_API long kh_select_timeout_ms(void)
 {
     if (!kh_combo_active || kh_combo_fired)
         return KROSSHAIR_RESYNC_TICK_MS;
@@ -262,7 +283,7 @@ static int kh_drain_device(int fd)
  * cancels the hold. Runs on every iteration (event and tick paths) so the
  * hold is evaluated even while held keys emit no new events.
  */
-static void kh_update_combo(int combo_bits)
+INPUT_API void kh_update_combo(int combo_bits)
 {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -383,3 +404,68 @@ void init_input_thread(void)
 {
         pthread_once(&kh_input_once, kh_input_init_once);
 }
+
+#ifdef UNIT_TEST
+/* Test hooks for the pure hotkey/combo logic (tests/test_input.c). */
+
+/* Clear the key bitmask and combo state (required-key list untouched). */
+void kh_input_test_reset(void)
+{
+    kh_keys_down = 0;
+    kh_combo_active = 0;
+    kh_combo_fired = 0;
+    kh_combo_down_ts.tv_sec = 0;
+    kh_combo_down_ts.tv_nsec = 0;
+}
+
+/* Number of required keys set by parse_hotkey. */
+int kh_input_test_required_count(void)
+{
+    return kh_required_key_count;
+}
+
+/* Required key at `index`, or -1 if out of range. */
+int kh_input_test_required_key(int index)
+{
+    if (index < 0 || index >= kh_required_key_count)
+        return -1;
+    return kh_required_keys[index];
+}
+
+/* Current required-keys bitmask (one bit per required key). */
+int kh_input_test_keys_down(void)
+{
+    return kh_keys_down;
+}
+
+/* Overwrite the required-keys bitmask (synthetic press/release). */
+void kh_input_test_set_keys_down(int mask)
+{
+    kh_keys_down = mask;
+}
+
+/* 1 while the full combo is held. */
+int kh_input_test_combo_active(void)
+{
+    return kh_combo_active;
+}
+
+/* 1 after the hotkey fired for the current hold. */
+int kh_input_test_combo_fired(void)
+{
+    return kh_combo_fired;
+}
+
+/* Set the combo active/fired flags directly. */
+void kh_input_test_set_combo(int active, int fired)
+{
+    kh_combo_active = active;
+    kh_combo_fired = fired;
+}
+
+/* Overwrite the combo-down timestamp (CLOCK_MONOTONIC). */
+void kh_input_test_set_combo_down_ts(const struct timespec* ts)
+{
+    kh_combo_down_ts = *ts;
+}
+#endif
