@@ -45,10 +45,12 @@ struct mock_queue_struct {
 
 static struct mock_instance_struct mock_instance_obj;
 static struct mock_physical_device_struct mock_physical_device_obj;
+static struct mock_device_struct mock_device_obj;
 static struct mock_queue_struct mock_queue_obj;
 
 #define MOCK_INSTANCE ((VkInstance)&mock_instance_obj)
 #define MOCK_PHYS     ((VkPhysicalDevice)&mock_physical_device_obj)
+#define MOCK_DEVICE   ((VkDevice)&mock_device_obj)
 #define MOCK_QUEUE    ((VkQueue)&mock_queue_obj)
 
 /*
@@ -60,6 +62,7 @@ static void mock_icd_init(void)
 {
         set_loader_magic_value(&mock_instance_obj);
         set_loader_magic_value(&mock_physical_device_obj);
+        set_loader_magic_value(&mock_device_obj);
         set_loader_magic_value(&mock_queue_obj);
 }
 
@@ -80,6 +83,7 @@ static void mock_destroy_device(VkDevice device,
 
 static uint64_t handle_counter = 0xAAAA0000;
 static uint32_t swapchain_image_count = 3;
+static struct mock_object* g_object_list;
 
 /* call counters read by the test via mock_icd_get_stats() */
 static int stats_submits     = 0;
@@ -120,6 +124,8 @@ struct mock_object {
         uint64_t magic; /* ICD_LOADER_MAGIC until the loader overwrites it */
         uint64_t serial; /* unique serial (handle_counter) for debugging */
         uint64_t size;   /* allocation size (memory objects only) */
+        struct mock_object* next; /* g_object_list link */
+        void* mapped;         /* mapped backing (memory objects only) */
 };
 
 /*
@@ -134,7 +140,32 @@ static void* mock_new_object(void)
                 return NULL;
         obj->serial = ++handle_counter;
         set_loader_magic_value(obj);
+        obj->next = g_object_list;
+        g_object_list = obj;
         return obj;
+}
+
+/*
+ * Release a handle's backing object, mirroring the driver freeing the
+ * object on its Destroy or FreeMemory call. The handle must have come
+ * from mock_new_object (i.e. be on g_object_list); anything else (the
+ * fake integer handles the mock hands out for swapchain images) is
+ * ignored, so double-destroy and foreign pointers can never free wild
+ * memory.
+ */
+static void mock_free_object(struct mock_object* obj)
+{
+        if (!obj)
+                return;
+        struct mock_object** pp = &g_object_list;
+        while (*pp && *pp != obj)
+                pp = &(*pp)->next;
+        if (*pp != obj)
+                return;
+        *pp = obj->next;
+        if (obj->mapped)
+                free(obj->mapped);
+        free(obj);
 }
 
 /*
@@ -298,11 +329,31 @@ static VkResult mock_allocate_memory(VkDevice device,
 }
 
 
-static void mock_destroy_handle(VkDevice device,
-                                const VkAllocationCallbacks* alloc)
+/*
+ * Shared destroy stub (vkDestroyX, vkFreeMemory): the second argument is
+ * the handle being destroyed (not an allocator), so its backing object
+ * is freed.
+ */
+static void mock_destroy_handle(VkDevice device, void* handle)
 {
         (void)device;
-        (void)alloc;
+        mock_free_object((struct mock_object*)handle);
+}
+
+/*
+ * vkBindBufferMemory/vkBindImageMemory take (device, handle, memory,
+ * offset, size); the mock has no real backing to bind, so the call is a
+ * no-op.
+ */
+static void mock_bind_memory(VkDevice device, void* handle,
+                             VkDeviceMemory memory, VkDeviceSize offset,
+                             VkDeviceSize size)
+{
+        (void)device;
+        (void)handle;
+        (void)memory;
+        (void)offset;
+        (void)size;
 }
 
 /* Command recording / execution stubs (the layer only counts calls). */
@@ -390,15 +441,22 @@ static VkResult mock_map_memory(VkDevice device, VkDeviceMemory memory,
         if (map_size == 0)
                 map_size = 4096;
         /* the layer memcpy's vertex data into the mapping */
-        if (pp_data)
+        struct mock_object* mem = (struct mock_object*)memory;
+        if (pp_data && mem) {
                 *pp_data = calloc(1, map_size);
+                mem->mapped = *pp_data;
+        }
         return VK_SUCCESS;
 }
 
 static void mock_unmap_memory(VkDevice device, VkDeviceMemory memory)
 {
         (void)device;
-        (void)memory;
+        struct mock_object* mem = (struct mock_object*)memory;
+        if (mem && mem->mapped) {
+                free(mem->mapped);
+                mem->mapped = NULL;
+        }
 }
 
 static void mock_update_descriptor_sets(VkDevice device, uint32_t descriptor_write_count,
@@ -466,8 +524,9 @@ static VkResult mock_acquire_next_image(VkDevice device,
 static void mock_destroy_swapchain(VkDevice device, VkSwapchainKHR swapchain,
                                    const VkAllocationCallbacks* alloc)
 {
-        mock_destroy_handle(device, alloc);
-        (void)swapchain;
+        (void)device;
+        (void)alloc;
+        mock_free_object((struct mock_object*)swapchain);
 }
 
 static VkResult mock_get_device_queue(VkDevice device,
@@ -517,9 +576,9 @@ static PFN_vkVoidFunction mock_device_gpa(VkDevice device,
         if (!strcmp(func_name, "vkBeginCommandBuffer"))
                 return (PFN_vkVoidFunction)mock_begin_command_buffer;
         if (!strcmp(func_name, "vkBindBufferMemory"))
-                return (PFN_vkVoidFunction)mock_destroy_handle;
+                return (PFN_vkVoidFunction)mock_bind_memory;
         if (!strcmp(func_name, "vkBindImageMemory"))
-                return (PFN_vkVoidFunction)mock_destroy_handle;
+                return (PFN_vkVoidFunction)mock_bind_memory;
         if (!strcmp(func_name, "vkCmdBeginRenderPass"))
                 return (PFN_vkVoidFunction)mock_cmd_noop;
         if (!strcmp(func_name, "vkCmdBindDescriptorSets"))
@@ -1064,19 +1123,44 @@ static VkResult mock_create_device(VkPhysicalDevice physical_device,
         (void)physical_device;
         (void)create_info;
         (void)allocator;
-        struct mock_device_struct* dev = calloc(1, sizeof(*dev));
-        if (!dev)
-                return VK_ERROR_OUT_OF_HOST_MEMORY;
-        set_loader_magic_value(dev);
-        *device = (VkDevice)dev;
+        *device = MOCK_DEVICE;
         return VK_SUCCESS;
 }
 
+/*
+ * The mock's device object is static, so there is nothing to free here.
+ * (This loader generation does not even invoke the ICD's DestroyDevice;
+ * the device-scoped cleanup lives in mock_icd_cleanup below.)
+ */
 static void mock_destroy_device(VkDevice device,
                                 const VkAllocationCallbacks* allocator)
 {
+        (void)device;
         (void)allocator;
-        free((void*)device);
+}
+
+/*
+ * The Vulkan spec lets a device destroy implicitly free every device-
+ * scoped object it created (except VkDeviceMemory and friends); a real
+ * driver does that in its own DestroyDevice. This loader generation
+ * never calls the ICD's DestroyDevice, so the equivalent cleanup runs
+ * when the mock is unloaded: free every backing object that survived
+ * (the layer's device-scoped stable resources and any command buffers
+ * it did not free explicitly). Objects already released by their
+ * destroy or FreeMemory path are off the list and skipped.
+ */
+__attribute__((destructor))
+static void mock_icd_cleanup(void)
+{
+        struct mock_object* obj = g_object_list;
+        while (obj) {
+                struct mock_object* next = obj->next;
+                if (obj->mapped)
+                        free(obj->mapped);
+                free(obj);
+                obj = next;
+        }
+        g_object_list = NULL;
 }
 
 /*
