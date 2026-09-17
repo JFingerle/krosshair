@@ -12,8 +12,17 @@
  *
  * Run via `make test` (it sets the environment); running it standalone
  * requires the env vars set by the Makefile.
+ *
+ * Custom-image angle: when KROSSHAIR_E2E_CUSTOM_IMG is set, the test
+ * generates a small 3-frame 11x13 APNG, writes it to a temp file and
+ * points KROSSHAIR_IMG at it. The layer decodes it into an 11x(13*3)
+ * vertical frame atlas and uploads it; that upload buffer becomes the
+ * largest single device-memory allocation, which differs from the
+ * built-in 50x50 crosshair's — so the max allocation observed by the
+ * mock identifies which image the layer loaded.
  */
 
+#define _GNU_SOURCE
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,10 +31,12 @@
 #include <dlfcn.h>
 #include <vulkan/vulkan.h>
 
+#include "apng_fixture.h"
 #include "test.h"
 
 typedef int (*stats_fn)(int* submits, int* cmdbufs, int* presents,
-                         int* swapchains, int* acquires, int* queue_queries);
+                         int* swapchains, int* acquires, int* queue_queries,
+                         VkDeviceSize* max_alloc);
 
 /*
  * Check a VkResult for success (VkResult is small, CHECK_EQ prints it).
@@ -78,6 +89,48 @@ static void test_mock_icd(void)
             (stats_fn)dlsym(handle, "mock_icd_get_stats");
         CHECK(stats != NULL);
 
+        /* ---- optional custom crosshair image ----
+
+         * When KROSSHAIR_E2E_CUSTOM_IMG is set, generate a 3-frame 11x13
+         * APNG, write it to a temp file and point KROSSHAIR_IMG at it.
+         * The layer must decode it into an 11x(13*3) vertical frame
+         * atlas; the resulting upload-buffer allocation differs from the
+         * built-in 50x50 crosshair's (asserted below).
+         */
+        int use_custom_image = getenv("KROSSHAIR_E2E_CUSTOM_IMG") != NULL;
+        char custom_path[64] = "";
+        if (use_custom_image) {
+                /* 3 frames of 11x13 RGBA, each a flat field of a different
+                 * value; 1/10 s delay per frame. */
+                unsigned char frame0[11 * 13 * 4];
+                unsigned char frame1[11 * 13 * 4];
+                unsigned char frame2[11 * 13 * 4];
+                memset(frame0, 0x33, sizeof(frame0));
+                memset(frame1, 0x66, sizeof(frame1));
+                memset(frame2, 0x99, sizeof(frame2));
+                const unsigned char* frames[3] = { frame0, frame1, frame2 };
+                uint16_t delay_nums[3] = { 1, 1, 1 };
+                uint16_t delay_dens[3] = { 10, 10, 10 };
+                /* 8 (SIG) + 25 (IHDR) + 20 (acTL)
+                 * + 3 * (38 (fcTL) + 12 (fdAT hdr) + 4 (seq) + 7 (zlib)
+                 *        + 11 * 13 * (4 * 11 + 1) (raw scanlines))
+                 * + 12 (IEND) */
+                unsigned char apng[19600];
+                size_t apng_len = build_apng(apng, 11, 13, 3, frames,
+                                             delay_nums, delay_dens);
+                CHECK(apng_len > 0);
+                /* decode_crosshair_file dispatches on the file
+                 * extension, so the fixture needs a .apng suffix
+                 * (mkstemp's trailing-XXXXXX rule rules out a suffix) */
+                const char* custom_name = "/tmp/kh_e2e_custom.apng";
+                FILE* f = fopen(custom_name, "wb");
+                CHECK(f != NULL);
+                CHECK(fwrite(apng, 1, apng_len, f) == apng_len);
+                fclose(f);
+                snprintf(custom_path, sizeof(custom_path), "%s", custom_name);
+                setenv("KROSSHAIR_IMG", custom_path, 1);
+        }
+
         /* ---- instance ---- */
 
         VkInstance instance = VK_NULL_HANDLE;
@@ -100,6 +153,8 @@ static void test_mock_icd(void)
                         "[test] loader did not load krosshair.so; "
                         "skipping end-to-end angle\n");
                 fflush(stderr);
+                if (use_custom_image)
+                        remove(custom_path);
                 return;
         }
 
@@ -209,8 +264,9 @@ static void test_mock_icd(void)
 
         int submits = 0, cmdbufs = 0, presents = 0;
         int swapchains = 0, acquires = 0, queue_queries = 0;
+        VkDeviceSize max_alloc = 0;
         CHECK(stats(&submits, &cmdbufs, &presents, &swapchains, &acquires,
-                    &queue_queries) == 0);
+                    &queue_queries, &max_alloc) == 0);
         /* 2 app submits (empty) + >= 1 overlay submit per present */
         CHECK(submits >= 4);
         /* the layer recorded and submitted its own draw command buffer
@@ -220,6 +276,21 @@ static void test_mock_icd(void)
         CHECK_EQ(swapchains, 1);
         CHECK_EQ(acquires, 2);
         CHECK(queue_queries >= 1);
+
+        /* The layer's crosshair upload buffer is the largest single
+         * device-memory allocation (image memory stays 1024 in the
+         * mock): its size is exactly the decoded atlas — 11x(13*3)x4
+         * = 1716 bytes for the custom APNG, 50x50x4 = 10000 bytes for
+         * the built-in crosshair. Proves the layer decoded the file
+         * KROSSHAIR_IMG points at (or fell back to the built-in
+         * image). */
+        VkDeviceSize expected = use_custom_image
+            ? (VkDeviceSize)(11 * 13 * 3 * 4)
+            : (VkDeviceSize)(50 * 50 * 4);
+        CHECK_EQ((int)max_alloc, (int)expected);
+
+        if (use_custom_image)
+                remove(custom_path);
 
         /* ---- teardown ---- */
 

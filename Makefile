@@ -86,6 +86,8 @@ test: all
 	# layers found via VK_LAYER_PATH, so the manifest is also placed in
 	# the standard per-user implicit layer dir and removed afterwards.
 	@mkdir -p "$(HOME)/.config/vulkan/implicit_layer.d" && cp $(BUILD_DIR)/vk_layer_path/krosshair.json "$(HOME)/.config/vulkan/implicit_layer.d/" && { VK_LAYER_PATH=$(BUILD_DIR)/vk_layer_path VK_DRIVER_FILES=$(MOCK_ICD_DIR)/mock_icd.json KROSSHAIR=1 MOCK_ICD_SO=$(CURDIR)/$(MOCK_ICD_SO) $(BUILD_DIR)/test_mock_icd; rc=$$?; rm -f "$(HOME)/.config/vulkan/implicit_layer.d/krosshair.json"; exit $$rc; }
+	echo "== running $(BUILD_DIR)/test_mock_icd (custom APNG crosshair)"
+	@mkdir -p "$(HOME)/.config/vulkan/implicit_layer.d" && cp $(BUILD_DIR)/vk_layer_path/krosshair.json "$(HOME)/.config/vulkan/implicit_layer.d/" && { VK_LAYER_PATH=$(BUILD_DIR)/vk_layer_path VK_DRIVER_FILES=$(MOCK_ICD_DIR)/mock_icd.json KROSSHAIR=1 KROSSHAIR_E2E_CUSTOM_IMG=1 MOCK_ICD_SO=$(CURDIR)/$(MOCK_ICD_SO) $(BUILD_DIR)/test_mock_icd; rc=$$?; rm -f "$(HOME)/.config/vulkan/implicit_layer.d/krosshair.json"; exit $$rc; }
 
 install:
 	sudo mkdir -p /usr/lib/krosshair

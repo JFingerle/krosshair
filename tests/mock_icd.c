@@ -88,13 +88,15 @@ static int stats_presents    = 0;
 static int stats_swapchains  = 0;
 static int stats_acquires    = 0;
 static int stats_queue_query = 0;
+static VkDeviceSize stats_max_alloc = 0;
 
 /*
  * Return the per-category call counts. Any pointer may be NULL to skip
  * that counter.
  */
 int mock_icd_get_stats(int* submits, int* cmdbufs, int* presents,
-                       int* swapchains, int* acquires, int* queue_queries)
+                        int* swapchains, int* acquires, int* queue_queries,
+                        VkDeviceSize* max_alloc)
 {
         if (submits) *submits = stats_submits;
         if (cmdbufs) *cmdbufs = stats_cmdbufs;
@@ -102,6 +104,7 @@ int mock_icd_get_stats(int* submits, int* cmdbufs, int* presents,
         if (swapchains) *swapchains = stats_swapchains;
         if (acquires) *acquires = stats_acquires;
         if (queue_queries) *queue_queries = stats_queue_query;
+        if (max_alloc) *max_alloc = stats_max_alloc;
         return 0;
 }
 
@@ -165,7 +168,25 @@ static VkResult mock_create_one(VkDevice device, const void* info,
                 return mock_create_one(device, info, alloc, (void*)out); \
         }
 
-DEF_CREATE(Buffer)
+/*
+ * Buffer creation records the requested size so GetBufferMemoryRequirements
+ * can report it; the layer sizes its crosshair upload buffer from that
+ * value, which the test uses to tell a custom image from the built-in
+ * one.
+ */
+static VkResult mock_CreateBuffer(VkDevice device,
+                                  const VkBufferCreateInfo* info,
+                                  const VkAllocationCallbacks* alloc,
+                                  VkBuffer* out)
+{
+        struct mock_object* obj = (struct mock_object*)mock_new_object();
+        if (!out || !obj)
+                return VK_ERROR_INITIALIZATION_FAILED;
+        obj->size = (uint64_t)info->size;
+        *out = (VkBuffer)obj;
+        return VK_SUCCESS;
+}
+
 DEF_CREATE(CommandPool)
 DEF_CREATE(DescriptorPool)
 DEF_CREATE(DescriptorSetLayout)
@@ -204,18 +225,23 @@ static void mock_memory_requirements(uint64_t size,
 }
 
 /*
- * Buffer/image memory requirements; the layer picks a memory type from
- * memoryTypeBits, so both advertised types must be set.
+ * Buffer memory requirements report the size recorded at CreateBuffer
+ * time; the layer picks a memory type from memoryTypeBits, so both
+ * advertised types must be set.
  */
 static void mock_get_buffer_memory_requirements(VkDevice device,
                                                 VkBuffer buffer,
                                                 VkMemoryRequirements* req)
 {
         (void)device;
-        (void)buffer;
-        mock_memory_requirements(1024, req);
+        mock_memory_requirements(((struct mock_object*)buffer)->size, req);
 }
 
+/*
+ * Image memory requirements stay fixed at 1024 so the crosshair upload
+ * buffer (the only size-reflecting allocation) remains the largest single
+ * device-memory allocation in the test.
+ */
 static void mock_get_image_memory_requirements(VkDevice device,
                                                VkImage image,
                                                VkMemoryRequirements* req)
@@ -265,6 +291,8 @@ static VkResult mock_allocate_memory(VkDevice device,
         if (!obj)
                 return VK_ERROR_INITIALIZATION_FAILED;
         obj->size = info->allocationSize;
+        if (info->allocationSize > stats_max_alloc)
+                stats_max_alloc = info->allocationSize;
         *memory = (VkDeviceMemory)obj;
         return VK_SUCCESS;
 }
