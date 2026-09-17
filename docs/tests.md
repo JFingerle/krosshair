@@ -1,15 +1,20 @@
 # Test suite
 
-The tests live in `tests/` and run with a single command:
+All tests are located in `tests/`.
+
+Use the following command to run all tests:
 
 ```
 make test
 ```
 
-The target builds `lib/krosshair.so` first (`test: all`), then builds and
-runs every `tests/test_*.c`, failing on the first failing suite. There is
-no test framework — `tests/test.h` is a small self-contained harness
-(`CHECK`, `CHECK_EQ`, `CHECK_PTR`, `CHECK_STR`, `TESTS_MAIN`); a suite
+The target builds `lib/krosshair.so` first (`test: all`), then builds
+and runs every `tests/test_*.c`, failing on the first failing suite.
+
+## Test framework
+
+We use a lightweight custom harness located at `tests/test.h`
+(`CHECK`, `CHECK_EQ`, `CHECK_PTR`, `CHECK_STR`, `TESTS_MAIN`). A suite
 exits non-zero if any check failed.
 
 Requirements are the same as the layer build (Vulkan headers), plus
