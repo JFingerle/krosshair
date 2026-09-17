@@ -14,13 +14,20 @@ make release   # used by PKGBUILD and CI (no -ggdb)
 - Language standard is **C99** (`-std=c99`), always compiled with `-Wall`. Keep the build warning-free.
 - Requires **Vulkan headers** to be installed (`vulkan-headers` on Arch / `libvulkan-dev` on Debian).
   A bare container will fail to build without them.
-- **There is no test suite and no linter/typecheck.** Verification is: `make all` builds clean
-  with no `-Wall` warnings, plus (for behavior) launching a Vulkan app with the layer, e.g.
-  `KROSSHAIR=1 vkcube`.
+- **Tests:** `make test` runs the unit suites plus an end-to-end run of the
+  layer through the real Vulkan loader against a mock ICD (see
+  `docs/tests.md`). There is no linter/typecheck; a dev build must also stay
+  warning-free under `-Wall`. For real-hardware behavior, launch a Vulkan app
+  with the layer, e.g. `KROSSHAIR=1 vkcube`.
 - Entry points live in `src/layer.c` (`overlay_CreateInstance`, `overlay_CreateDevice`,
   `overlay_GetInstanceProcAddr`, `overlay_GetDeviceProcAddr`). The huge command table in
   `src/dispatch.c` is built with the `DISPATCH_LOAD(table, gpa, scope, NAME)` macro — search for
   a command by its entry name (e.g. `AcquireNextImageKHR`), **not** by `vkAcquireNextImageKHR`.
+
+## Documentation
+
+- Project documentation lives in `docs/` — currently `docs/tests.md`, which
+  covers the unit-test suites and the mock-ICD end-to-end setup.
 
 ## Shaders (codegen gotcha)
 
