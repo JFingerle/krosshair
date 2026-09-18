@@ -174,3 +174,4 @@ Krosshair prints `[KH]` log messages to `stderr`.
   PROTON_LOG=1 KROSSHAIR=1 %command%
   ```
   The log file is written to `~` (native Steam installation) or `~/.var/app/com.valvesoftware.Steam` (Flatpak installation).
+- **Performance Debugging** — Set env var `KROSSHAIR_PERFLOGGING=1` to see performance related log messages like memory usage.
