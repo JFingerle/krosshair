@@ -15,6 +15,12 @@
 
 #include "../include/krosshair.h"
 
+#ifdef UNIT_TEST
+#define RENDER_API
+#else
+#define RENDER_API static
+#endif
+
 /*
  * Wait for this draw slot's previous GPU submission to finish so its
  * command buffer can be safely re-recorded.
@@ -27,8 +33,9 @@
  * not finish within 100 ms (the caller should skip this frame — a slot
  * must never be destroyed while its submit is in flight).
  */
-static int wait_draw_slot_ready(device_data_t* device_data,
-                                krosshair_draw_t* draw, unsigned image_index)
+RENDER_API int wait_draw_slot_ready(device_data_t* device_data,
+                                    krosshair_draw_t* draw,
+                                    unsigned image_index)
 {
         if (!draw->fence_submitted)
                 return 1;
@@ -54,7 +61,7 @@ static int wait_draw_slot_ready(device_data_t* device_data,
  * data  The swapchain state holding the texture handles (destroyed and
  *       rebuilt here if missing or sized for a different resolution).
  */
-static void ensure_game_fb_copy(swapchain_data_t* data)
+RENDER_API void ensure_game_fb_copy(swapchain_data_t* data)
 {
         device_data_t* device_data = data->device_data;
 
@@ -144,10 +151,10 @@ static void ensure_game_fb_copy(swapchain_data_t* data)
  * image_index    Which swapchain image to copy.
  * present_queue  Queue the image was last presented on (source family).
  */
-static void record_framebuffer_copy(swapchain_data_t* data,
-                                    VkCommandBuffer cmd_buffer,
-                                    unsigned image_index,
-                                    queue_data_t* present_queue)
+RENDER_API void record_framebuffer_copy(swapchain_data_t* data,
+                                        VkCommandBuffer cmd_buffer,
+                                        unsigned image_index,
+                                        queue_data_t* present_queue)
 {
         device_data_t* device_data = data->device_data;
 
@@ -237,10 +244,10 @@ static void record_framebuffer_copy(swapchain_data_t* data,
  * image_index    Which swapchain image to transition.
  * present_queue  Queue the image was last presented on (source family).
  */
-static void transition_swapchain_for_render(swapchain_data_t* data,
-                                            VkCommandBuffer cmd_buffer,
-                                            unsigned image_index,
-                                            queue_data_t* present_queue)
+RENDER_API void transition_swapchain_for_render(swapchain_data_t* data,
+                                                VkCommandBuffer cmd_buffer,
+                                                unsigned image_index,
+                                                queue_data_t* present_queue)
 {
         device_data_t* device_data = data->device_data;
 
@@ -278,7 +285,8 @@ static void transition_swapchain_for_render(swapchain_data_t* data,
  * draw  The draw slot being recorded (flagged dirty so the updated
  *      vertex buffer is re-uploaded).
  */
-static void advance_anim_frame(swapchain_data_t* data, krosshair_draw_t* draw)
+RENDER_API void advance_anim_frame(swapchain_data_t* data,
+                                   krosshair_draw_t* draw)
 {
         if (data->anim_frame_count <= 1 || !data->anim_delays)
                 return;
@@ -341,9 +349,9 @@ static void advance_anim_frame(swapchain_data_t* data, krosshair_draw_t* draw)
  * data          Host source.
  * bytes         Number of bytes to copy.
  */
-static void upload_device_memory(device_data_t* device_data,
-                                 VkDeviceMemory memory,
-                                 const void* data, size_t bytes)
+RENDER_API void upload_device_memory(device_data_t* device_data,
+                                     VkDeviceMemory memory,
+                                     const void* data, size_t bytes)
 {
         void* mapped = NULL;
         VK_CHECK(device_data->vtable.MapMemory(
@@ -368,9 +376,9 @@ static void upload_device_memory(device_data_t* device_data,
  * data          Swapchain state (vertex array to upload).
  * draw          The draw slot owning the GPU buffers.
  */
-static void ensure_quad_buffers(device_data_t* device_data,
-                                swapchain_data_t* data,
-                                krosshair_draw_t* draw)
+RENDER_API void ensure_quad_buffers(device_data_t* device_data,
+                                    swapchain_data_t* data,
+                                    krosshair_draw_t* draw)
 {
         size_t vertex_size = sizeof(data->vertices);
         size_t index_size  = sizeof(indices);
@@ -411,8 +419,8 @@ static void ensure_quad_buffers(device_data_t* device_data,
  *      constants).
  * draw  The draw slot (second vertex buffer, command buffer).
  */
-static void record_dynamic_mask_draw(swapchain_data_t* data,
-                                     krosshair_draw_t* draw)
+RENDER_API void record_dynamic_mask_draw(swapchain_data_t* data,
+                                         krosshair_draw_t* draw)
 {
         device_data_t* device_data = data->device_data;
         if (!data->dynamic_mask.uploaded || !device_data->shader_pipeline ||
@@ -520,11 +528,11 @@ static void record_dynamic_mask_draw(swapchain_data_t* data,
  *
  * Returns 0 on success, -1 on failure (the caller skips this frame).
  */
-static int submit_overlay_draw(device_data_t* device_data,
-                               krosshair_draw_t* draw,
-                               queue_data_t* present_queue,
-                               const VkSemaphore* wait_semaphores,
-                               unsigned n_wait_semaphores)
+RENDER_API int submit_overlay_draw(device_data_t* device_data,
+                                   krosshair_draw_t* draw,
+                                   queue_data_t* present_queue,
+                                   const VkSemaphore* wait_semaphores,
+                                   unsigned n_wait_semaphores)
 {
         VkResult submit_result = VK_SUCCESS;
 

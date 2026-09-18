@@ -38,6 +38,7 @@ not a unit test (see "End-to-end" below).
 | `test_crosshair.c` | the device-independent parts of `src/crosshair.c`: push-constant defaults and `.cfg` parsing, quad vertex setup, file helpers (mtime, whole-file read, change detection), image path resolution, animation state setup, and image decoding (static PNG, animated APNG atlas, content sniffing, garbage/missing files) |
 | `test_input.c` | the pure hotkey/combo logic in `src/input.c`: `parse_hotkey`, `kh_key_index`, `kh_apply_event`, `kh_elapsed_ms`, `kh_update_combo`, `kh_select_timeout_ms`. The evdev scanning / background-thread code is not exercised |
 | `test_gpu.c` | `vk_memory_type()` in `src/gpu.c`: a stub `GetPhysicalDeviceMemoryProperties` vtable returns a synthesized `VkMemoryProperties`, and the suite asserts the selected type index for various requirement/flag combinations |
+| `test_render.c` | the overlay render path in `src/render.c`: fence wait/ready handling, swapchain layout transitions, framebuffer-copy recording, crosshair and dynamic-mask upload sequences, quad-buffer creation, and the submit topology (single same-family submit vs two cross-engine submits) — driven against a recording stub vtable with the built-in crosshair (HOME pointed at an empty directory) |
 
 Adding a new suite requires no Makefile change: the `test_*.c` wildcard
 picks it up (linked with `-lm -lpthread`).
@@ -55,11 +56,12 @@ are marked with a per-file API macro:
 #endif
 ```
 
-`LAYER_API` (`src/layer.c`), `CROSSHAIR_API` (`src/crosshair.c`) and
-`INPUT_API` (`src/input.c`) follow this pattern; the matching declarations
-live in `tests/test_layer_api.h` and `tests/test_input_api.h` (types must
-stay in sync with the sources). `src/gpu.c`'s `vk_memory_type` needs no
-macro because it is non-static already.
+`LAYER_API` (`src/layer.c`), `CROSSHAIR_API` (`src/crosshair.c`),
+`INPUT_API` (`src/input.c`) and `RENDER_API` (`src/render.c`) follow this
+pattern; the matching declarations live in `tests/test_layer_api.h`,
+`tests/test_input_api.h` and `tests/test_render_api.h` (types must stay in
+sync with the sources). `src/gpu.c`'s `vk_memory_type` needs no macro
+because it is non-static already.
 
 Release builds keep everything static — no test symbols ship in
 `lib/krosshair.so`.
@@ -157,8 +159,9 @@ before the binary and Flatpak builds).
 
 ## Not covered
 
-- Render-path Vulkan state is checked only through the mock's call
-  counters, not against a real driver; `KROSSHAIR=1 vkcube` remains the
+- The render path's logic is covered by `test_render.c`'s stub vtable, but
+  no unit test runs against a real driver — actual GPU behavior is checked
+  only through the mock's call counters; `KROSSHAIR=1 vkcube` remains the
   real-hardware smoke test (see the README).
 - Shaders are committed as SPIR-V artifacts with no regeneration target
   and no test (see `AGENTS.md`).
