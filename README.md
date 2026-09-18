@@ -35,12 +35,12 @@ This is an overlay (not really a crosshair) which helps against motion sickness 
 
 ## <del>Option 1: Via Arch Linux AUR</del>
 
-This fork (jfingerle/krosshair-flatpak) is currently not available on the AUR, only the original [noahlyk/krosshair](https://github.com/noahlyk/krosshair) fork.
+This fork (jfingerle/krosshair) is currently not available on the AUR.
 
 ## Option 2: Build from Source
 
 ```bash
-git clone https://github.com/jfingerle/krosshair-flatpak.git
+git clone https://github.com/jfingerle/krosshair.git
 cd krosshair
 make install
 ```
@@ -52,7 +52,7 @@ Necessary if your games (and apps like Steam / Lutris / Heroic) run via Flatpak.
 After the installation you need to restart all Flatpak apps which you use to run games (Steam, Heroic, Lutris etc.).
 
 ### Option 1: Download Github Release
-- Download **all** .flatpack files from the [releases page](https://github.com/jfingerle/krosshair-flatpak/releases).
+- Download **all** .flatpack files from the [releases page](https://github.com/jfingerle/krosshair/releases).
 - Install via double-clicking the file in your file manager (or run `flatpak install (--user) filename.flatpak` in your terminal).
 
 
@@ -62,7 +62,7 @@ Builds and installs Flatpak bundles for the supported runtime versions (24.08, 2
 
 ```bash
 sudo pacman -S flatpak-builder
-git clone https://github.com/jfingerle/krosshair-flatpak.git
+git clone https://github.com/jfingerle/krosshair.git
 cd krosshair
 make flatpak-install
 ```
