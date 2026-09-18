@@ -178,6 +178,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   aur:
+    if: false # Disable job because this fork (jfingerle) is currently not available on the AUR.
     needs: [version, build, release]
     runs-on: ubuntu-latest
     container: archlinux:latest
