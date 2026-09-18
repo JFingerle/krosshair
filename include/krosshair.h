@@ -210,6 +210,10 @@ typedef struct swapchain_data {
         VkDeviceMemory crosshair_mem;
         VkBuffer crosshair_upload_buffer;
         VkDeviceMemory crosshair_upload_buffer_mem;
+        /* draw slot whose submitted commands reference the upload
+         * buffer; the buffer is released once that slot's fence
+         * signals */
+        krosshair_draw_t* crosshair_upload_draw;
 
         char* crosshair_path;
         struct timespec crosshair_mtime;

@@ -646,6 +646,27 @@ krosshair_draw_t* render_swapchain_display(
         if (!wait_draw_slot_ready(device_data, draw, image_index))
                 return NULL;
 
+        /* The slot's fence has signalled (or the slot was never
+         * submitted), so a previously recorded upload copy is done
+         * and its staging buffer can go. */
+        if (swapchain_data->crosshair_upload_draw == draw &&
+            swapchain_data->crosshair_upload_buffer != VK_NULL_HANDLE) {
+                device_data->vtable.DestroyBuffer(
+                    device_data->device, swapchain_data->crosshair_upload_buffer,
+                    NULL);
+                swapchain_data->crosshair_upload_buffer = VK_NULL_HANDLE;
+                if (swapchain_data->crosshair_upload_buffer_mem) {
+                        kh_perflog_dev_free(
+                            swapchain_data->crosshair_upload_buffer_mem);
+                        device_data->vtable.FreeMemory(
+                            device_data->device,
+                            swapchain_data->crosshair_upload_buffer_mem, NULL);
+                        swapchain_data->crosshair_upload_buffer_mem =
+                                VK_NULL_HANDLE;
+                }
+                swapchain_data->crosshair_upload_draw = NULL;
+        }
+
         device_data->vtable.ResetCommandBuffer(draw->cmd_buffer, 0);
 
         VkRenderPassBeginInfo render_pass_info = {};

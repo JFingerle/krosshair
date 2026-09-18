@@ -683,8 +683,19 @@ void ensure_swapchain_crosshair(swapchain_data_t* data,
                 upload_image_data(
                     device_data, cmd_buffer, (stbi_uc*)default_crosshair_data,
                     image_size, tex_width, tex_height,
-                    &data->crosshair_upload_buffer,
-                    &data->crosshair_upload_buffer_mem, data->crosshair_image);
+                     &data->crosshair_upload_buffer,
+                     &data->crosshair_upload_buffer_mem, data->crosshair_image);
+        }
+
+        /* The upload copy was recorded in this slot's command buffer;
+         * remember the slot so the render path can release the upload
+         * buffer once the slot's fence signals. */
+        for (uint32_t i = 0; i < data->n_images; i++) {
+                if (data->draws[i] &&
+                    data->draws[i]->cmd_buffer == cmd_buffer) {
+                        data->crosshair_upload_draw = data->draws[i];
+                        break;
+                }
         }
 
         data->crosshair_tex_width = tex_width;
