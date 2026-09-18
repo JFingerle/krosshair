@@ -1,15 +1,17 @@
 # krosshair - Crosshair Overlay for Games on Linux
 
 * Works on **Native / Non-Flatpak** systems (e.g. Arch Linux, CachyOS, Ubuntu etc.)
-* Works on **Flatpak** systems (e.g.Bazitte).
+* Works on **Flatpak** systems (e.g.Bazzite).
 * Works with **Steam** and **non-Steam** games.
 
 
 ## This Fork - Differences to `noahlyk/krosshair`
 
-* Hotkey added to toggle the crosshair (press `SHIFT_R` + `F9`, see `Usage` chapter below on how to change the hotkey).
-* Rendering fixed on 4K and other resolutions ([PR](https://github.com/noahlyk/krosshair/pull/2)).
-* Flatpak build added ([PR](https://github.com/noahlyk/krosshair/pull/1)).
+* Hotkey added to toggle the crosshair (press `SHIFT_R` + `F9`, see `Configuration` chapter below on how to change the hotkey)
+* Rendering fixed on 4K and other resolutions ([PR](https://github.com/noahlyk/krosshair/pull/2))
+* Memory leak fixed
+* Flatpak build added ([PR](https://github.com/noahlyk/krosshair/pull/1))
+* Code refactored and tests added
 
 <br>
 
@@ -76,17 +78,29 @@ Afterwards you need to restart all Flatpak apps which you use to run games (Stea
 
 <br>
 
+# Configuration
+
+Krosshair is configured via environment variables (see `Usage` below for how to set them for Steam and non-Steam games).
+
+| Variable | Description |
+|----------|-------------|
+| `KROSSHAIR` | Set to `1` to enable the overlay. |
+| `KROSSHAIR_IMG` | Path to the crosshair image to load (PNG, GIF or APNG). Defaults to `~/.config/crosshair-maker/projects/current.png`. |
+| `KROSSHAIR_HOTKEY_TOGGLE` | Hotkey to toggle the crosshair, default `SHIFT_R+F9`. Any modifier (`shift_l`, `shift_r`, `ctrl_l`, `ctrl_r`, `alt_l`, `alt_r`) can be combined with a letter, digit, `f1`–`f24`, `space`, `tab`, `escape` etc. Example: `KROSSHAIR_HOTKEY_TOGGLE=ctrl_r+1`. |
+
+<br>
+
 # Usage
 
 ## Steam Games
 
-Add the follwoing launch option:
+Add the following launch option:
 
 ```
 KROSSHAIR=1 %command%
 ```
 
-To use a custom crosshair (from the `crosshairs` dir of this repo):
+To use a custom crosshair (for example from the `crosshairs` dir of this repo):
 
 ```
 KROSSHAIR=1 KROSSHAIR_IMG=/optional/path/to/crosshair.png %command%
@@ -101,9 +115,9 @@ KROSSHAIR=1 KROSSHAIR_HOTKEY_TOGGLE=SHIFT_R+F7 %command%
 ## Non-Steam Games
 
 ```bash
-export KROSSHAIR=1
-#export KROSSHAIR_IMG=/path/to/crosshair.png # To use a custom crosshair (from the `crosshairs` dir of this repo)
-#export KROSSHAIR_HOTKEY_TOGGLE=SHIFT_R+F7 # To use a different hotkey to toggle the crosshair
+export KROSSHAIR=1 # to enable Krosshair
+export KROSSHAIR_IMG=/path/to/crosshair.png # To use a custom crosshair (for example from the `crosshairs` dir of this repo)
+export KROSSHAIR_HOTKEY_TOGGLE=SHIFT_R+F7 # To use a different hotkey to toggle the crosshair
 your-game
 ```
 
@@ -127,14 +141,14 @@ $ crosshair-maker &
 # FAQ / Various
 
 ## Can i get banned for this?
-This project is quite similar to `MangoHud` so it should be safe to use, but use it at your own risk. The original author has so for tested it in Quake Champions and STRAFTAT, both of which don't really have an anticheat.
+This project is quite similar to `MangoHud` so it should be safe to use, but use it at your own risk.
 
 ## Why does Krosshair not work?
 - Flatpak: Restart your Flatpak apps like Steam/Lutris/Heroic which you use to start your games. Or simply reboot after the installation.
 - Check the logs, see section `Are there any logs which I can use to troubleshoot issues?` below?
 
 ## What hotkeys can I use?
-The hotkey to toggle the crosshair can be set via env var `KROSSHAIR_HOTKEY_TOGGLE`. Any modifier (`shift_l`, `shift_r`, `ctrl_l`, `ctrl_r`, `alt_l`, `alt_r`) can be combined with a letter, digit, `f1`–`f24`, `space`, `tab`, `escape` etc. For example `KROSSHAIR_HOTKEY_TOGGLE=ctrl_r+1`
+The hotkey to toggle the crosshair can be set via env var `KROSSHAIR_HOTKEY_TOGGLE`, see `Configuration` for the allowed syntax.
 
 ## Why does it not use my crosshair file?
 The layer prints diagnostic messages to `stderr`. Look for lines starting with `[KH]`:
@@ -160,6 +174,3 @@ Krosshair prints `[KH]` log messages to `stderr`.
   PROTON_LOG=1 KROSSHAIR=1 %command%
   ```
   The log file is written to `~` (native Steam installation) or `~/.var/app/com.valvesoftware.Steam` (Flatpak installation).
-
-## Any known issues?
-- The [original author krob64](https://github.com/krob64) mentioned a small [memory leak](https://github.com/krob64/krosshair/issues/1). While testing [I](https://github.com/jfingerle) could not reproduce the memory leak (even after alt+tabbing out of the game multiple times, minimizing etc.). [My](https://github.com/jfingerle) assumption is that this issue has been fixed with changes to the code of this fork.
