@@ -81,6 +81,7 @@ RENDER_API void ensure_game_fb_copy(swapchain_data_t* data)
                 data->game_fb_image = VK_NULL_HANDLE;
         }
         if (data->game_fb_mem) {
+                kh_perflog_dev_free(data->game_fb_mem);
                 device_data->vtable.FreeMemory(
                     device_data->device, data->game_fb_mem, NULL);
                 data->game_fb_mem = VK_NULL_HANDLE;
@@ -117,6 +118,7 @@ RENDER_API void ensure_game_fb_copy(swapchain_data_t* data)
                            mem_req.memoryTypeBits);
         VK_CHECK(device_data->vtable.AllocateMemory(
             device_data->device, &alloc_info, NULL, &data->game_fb_mem));
+        kh_perflog_dev_alloc(data->game_fb_mem, mem_req.size);
         VK_CHECK(device_data->vtable.BindImageMemory(
             device_data->device, data->game_fb_image,
             data->game_fb_mem, 0));

@@ -186,6 +186,7 @@ instance_data_t* new_instance_data(VkInstance instance)
 {
         instance_data_t* instance_data = malloc(sizeof(instance_data_t));
         memset(instance_data, 0, sizeof(*instance_data));
+        kh_perflog_host_alloc(sizeof(instance_data_t), "instance data");
         instance_data->instance = instance;
         KROSSHAIR_LOG("[*] mapping data->instance obj: %lu data: %p\n",
                 HKEY(instance_data->instance), (void*)instance_data);
@@ -207,6 +208,7 @@ device_data_t* new_device_data(VkDevice device, instance_data_t* instance)
 {
         device_data_t* device_data = malloc(sizeof(device_data_t));
         memset(device_data, 0, sizeof(*device_data));
+        kh_perflog_host_alloc(sizeof(device_data_t), "device data");
         device_data->instance = instance;
         device_data->device   = device;
         KROSSHAIR_LOG("[*] mapping data->device obj: %lu %p\n",
@@ -261,6 +263,7 @@ static queue_data_t* new_queue_data(VkQueue queue,
 {
         queue_data_t* queue_data = malloc(sizeof(*queue_data));
         memset(queue_data, 0, sizeof(*queue_data));
+        kh_perflog_host_alloc(sizeof(*queue_data), "queue data");
         queue_data->device       = device_data;
         queue_data->queue        = queue;
         queue_data->flags        = family_props->queueFlags;

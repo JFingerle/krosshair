@@ -74,6 +74,7 @@ void create_or_resize_buffer(device_data_t* device_data,
                                                   NULL);
         }
         if (*buffer_mem) {
+                kh_perflog_dev_free(*buffer_mem);
                 device_data->vtable.FreeMemory(device_data->device, *buffer_mem,
                                                NULL);
         }
@@ -104,6 +105,7 @@ void create_or_resize_buffer(device_data_t* device_data,
                            req.memoryTypeBits);
         VK_CHECK(device_data->vtable.AllocateMemory(
             device_data->device, &alloc_info, NULL, buffer_mem));
+        kh_perflog_dev_alloc(*buffer_mem, req.size);
 
         VK_CHECK(device_data->vtable.BindBufferMemory(device_data->device,
                                                       *buffer, *buffer_mem, 0));
@@ -141,6 +143,7 @@ void shutdown_krosshair_image(swapchain_data_t* data)
                 data->crosshair_image = VK_NULL_HANDLE;
         }
         if (data->crosshair_mem) {
+                kh_perflog_dev_free(data->crosshair_mem);
                 device_data->vtable.FreeMemory(device_data->device, data->crosshair_mem,
                                                NULL);
                 data->crosshair_mem = VK_NULL_HANDLE;
@@ -152,6 +155,7 @@ void shutdown_krosshair_image(swapchain_data_t* data)
                 data->crosshair_upload_buffer = VK_NULL_HANDLE;
         }
         if (data->crosshair_upload_buffer_mem) {
+                kh_perflog_dev_free(data->crosshair_upload_buffer_mem);
                 device_data->vtable.FreeMemory(device_data->device,
                                                data->crosshair_upload_buffer_mem, NULL);
                 data->crosshair_upload_buffer_mem = VK_NULL_HANDLE;
@@ -174,6 +178,8 @@ void shutdown_krosshair_image(swapchain_data_t* data)
 
         /* clean up animation state */
         if (data->anim_delays) {
+                kh_perflog_host_free(sizeof(int) * data->anim_frame_count,
+                                     "anim delays");
                 free(data->anim_delays);
                 data->anim_delays = NULL;
         }
@@ -211,6 +217,7 @@ void shutdown_dynamic_mask(swapchain_data_t* data)
                 data->dynamic_mask.image = VK_NULL_HANDLE;
         }
         if (data->dynamic_mask.mem) {
+                kh_perflog_dev_free(data->dynamic_mask.mem);
                 device_data->vtable.FreeMemory(device_data->device,
                                                data->dynamic_mask.mem, NULL);
                 data->dynamic_mask.mem = VK_NULL_HANDLE;
@@ -221,6 +228,7 @@ void shutdown_dynamic_mask(swapchain_data_t* data)
                 data->dynamic_mask.upload_buffer = VK_NULL_HANDLE;
         }
         if (data->dynamic_mask.upload_buffer_mem) {
+                kh_perflog_dev_free(data->dynamic_mask.upload_buffer_mem);
                 device_data->vtable.FreeMemory(device_data->device,
                                                data->dynamic_mask.upload_buffer_mem, NULL);
                 data->dynamic_mask.upload_buffer_mem = VK_NULL_HANDLE;
@@ -291,6 +299,7 @@ void destroy_swapchain_data(swapchain_data_t* data)
                 data->game_fb_image = VK_NULL_HANDLE;
         }
         if (data->game_fb_mem) {
+                kh_perflog_dev_free(data->game_fb_mem);
                 device_data->vtable.FreeMemory(device_data->device,
                                                data->game_fb_mem, NULL);
                 data->game_fb_mem = VK_NULL_HANDLE;
@@ -314,14 +323,20 @@ void destroy_swapchain_data(swapchain_data_t* data)
         data->n_images = 0;
 
         if (data->crosshair_path) {
+                kh_perflog_host_free(strlen(data->crosshair_path) + 1,
+                                     "crosshair path");
                 free(data->crosshair_path);
                 data->crosshair_path = NULL;
         }
         if (data->dynamic_mask.path) {
+                kh_perflog_host_free(strlen(data->dynamic_mask.path) + 1,
+                                     "mask path");
                 free(data->dynamic_mask.path);
                 data->dynamic_mask.path = NULL;
         }
         if (data->dynamic_cfg_path) {
+                kh_perflog_host_free(strlen(data->dynamic_cfg_path) + 1,
+                                     "cfg path");
                 free(data->dynamic_cfg_path);
                 data->dynamic_cfg_path = NULL;
         }
@@ -406,6 +421,7 @@ void create_image(swapchain_data_t* data, VkDescriptorSet descriptor_set,
                            kh_image_req.memoryTypeBits);
         VK_CHECK(device_data->vtable.AllocateMemory(
             device_data->device, &image_alloc_info, NULL, image_mem));
+        kh_perflog_dev_alloc(*image_mem, kh_image_req.size);
         VK_CHECK(device_data->vtable.BindImageMemory(device_data->device,
                                                      *image, *image_mem, 0));
 
@@ -485,6 +501,7 @@ static void create_or_resize_upload_buffer(device_data_t* device_data,
                 *upload_buffer = VK_NULL_HANDLE;
         }
         if (*upload_buffer_mem) {
+                kh_perflog_dev_free(*upload_buffer_mem);
                 device_data->vtable.FreeMemory(device_data->device, *upload_buffer_mem,
                                                NULL);
                 *upload_buffer_mem = VK_NULL_HANDLE;
@@ -510,6 +527,7 @@ static void create_or_resize_upload_buffer(device_data_t* device_data,
                            upload_buffer_req.memoryTypeBits);
         VK_CHECK(device_data->vtable.AllocateMemory(
             device_data->device, &upload_alloc_info, NULL, upload_buffer_mem));
+        kh_perflog_dev_alloc(*upload_buffer_mem, upload_buffer_req.size);
         VK_CHECK(device_data->vtable.BindBufferMemory(
             device_data->device, *upload_buffer, *upload_buffer_mem, 0));
 }

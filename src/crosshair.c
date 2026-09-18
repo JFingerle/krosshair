@@ -333,6 +333,7 @@ CROSSHAIR_API void setup_animation_state(swapchain_data_t* data, int frame_count
         clock_gettime(CLOCK_MONOTONIC, &data->anim_last_frame_time);
 
         data->anim_delays = malloc(sizeof(int) * frame_count);
+        kh_perflog_host_alloc(sizeof(int) * frame_count, "anim delays");
         for (int i = 0; i < frame_count; i++)
                 data->anim_delays[i] = delays_ms && delays_ms[i] > 0
                     ? delays_ms[i] : 100;
@@ -607,6 +608,8 @@ void ensure_swapchain_crosshair(swapchain_data_t* data,
 
                 shutdown_krosshair_image(data);
                 data->crosshair_uploaded = 0;
+                kh_perflog_host_free(strlen(data->crosshair_path) + 1,
+                                     "crosshair path");
                 free(data->crosshair_path);
                 data->crosshair_path = NULL;
         }
@@ -632,6 +635,8 @@ void ensure_swapchain_crosshair(swapchain_data_t* data,
 
                 /* the path's ownership moves to the swapchain so its
                  * mtime can be watched for hot-reloads */
+                kh_perflog_host_alloc(strlen(crosshair_path) + 1,
+                                      "crosshair path");
                 data->crosshair_path = crosshair_path;
                 get_file_mtime(data->crosshair_path, &data->crosshair_mtime);
                 KROSSHAIR_LOG("[KROSSHAIR] loaded crosshair from: %s (mtime %ld.%ld)\n",
@@ -735,6 +740,8 @@ void ensure_swapchain_dynamic_mask(swapchain_data_t* data,
                 } else if (!using_file && data->dynamic_mask.path) {
                         shutdown_dynamic_mask(data);
                         data->dynamic_mask.uploaded = 0;
+                        kh_perflog_host_free(strlen(data->dynamic_mask.path) + 1,
+                                             "mask path");
                         free(data->dynamic_mask.path);
                         data->dynamic_mask.path = NULL;
                         free(mask_path);
@@ -749,6 +756,8 @@ void ensure_swapchain_dynamic_mask(swapchain_data_t* data,
 
                 shutdown_dynamic_mask(data);
                 data->dynamic_mask.uploaded = 0;
+                kh_perflog_host_free(strlen(data->dynamic_mask.path) + 1,
+                                     "mask path");
                 free(data->dynamic_mask.path);
                 data->dynamic_mask.path = NULL;
                 /* free THIS swapchain's mask set (targeted, not a bulk pool reset) —
@@ -792,6 +801,7 @@ void ensure_swapchain_dynamic_mask(swapchain_data_t* data,
             &data->dynamic_mask.upload_buffer_mem, data->dynamic_mask.image);
         stbi_image_free(pixels);
 
+        kh_perflog_host_alloc(strlen(mask_path) + 1, "mask path");
         data->dynamic_mask.path = mask_path;
         get_file_mtime(mask_path, &data->dynamic_mask.mtime);
         data->dynamic_mask.tex_width = tex_width;
@@ -823,12 +833,15 @@ check_cfg:
                         /* first time loading cfg */
                         parse_dynamic_cfg(cfg_path, &data->dynamic_pc);
                         get_file_mtime(cfg_path, &data->dynamic_cfg_mtime);
+                        kh_perflog_host_alloc(strlen(cfg_path) + 1, "cfg path");
                         data->dynamic_cfg_path = cfg_path;
                         cfg_path = NULL; /* don't free, ownership transferred */
                         KROSSHAIR_LOG("[KROSSHAIR] loaded dynamic cfg: %s\n", data->dynamic_cfg_path);
                 } else if (!cfg_exists && data->dynamic_cfg_path) {
                         /* cfg file was removed */
                         parse_dynamic_cfg(NULL, &data->dynamic_pc);
+                        kh_perflog_host_free(strlen(data->dynamic_cfg_path) + 1,
+                                             "cfg path");
                         free(data->dynamic_cfg_path);
                         data->dynamic_cfg_path = NULL;
                 }
@@ -855,6 +868,7 @@ krosshair_draw_t* create_draw_slot(swapchain_data_t* data, uint32_t slot)
 
         krosshair_draw_t* draw = malloc(sizeof(*draw));
         memset(draw, 0, sizeof(*draw));
+        kh_perflog_host_alloc(sizeof(*draw), "draw slot");
 
         VkCommandBufferAllocateInfo cmd_buffer_info = {};
         cmd_buffer_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -903,6 +917,7 @@ void destroy_draw(swapchain_data_t* data, krosshair_draw_t* draw)
                                                   draw->vertex_buffer, NULL);
         }
         if (draw->vertex_buffer_mem != VK_NULL_HANDLE) {
+                kh_perflog_dev_free(draw->vertex_buffer_mem);
                 device_data->vtable.FreeMemory(device_data->device,
                                                draw->vertex_buffer_mem, NULL);
         }
@@ -911,6 +926,7 @@ void destroy_draw(swapchain_data_t* data, krosshair_draw_t* draw)
                                                   draw->vertex_buffer2, NULL);
         }
         if (draw->vertex_buffer2_mem != VK_NULL_HANDLE) {
+                kh_perflog_dev_free(draw->vertex_buffer2_mem);
                 device_data->vtable.FreeMemory(device_data->device,
                                                draw->vertex_buffer2_mem, NULL);
         }
@@ -919,6 +935,7 @@ void destroy_draw(swapchain_data_t* data, krosshair_draw_t* draw)
                                                   draw->index_buffer, NULL);
         }
         if (draw->index_buffer_mem != VK_NULL_HANDLE) {
+                kh_perflog_dev_free(draw->index_buffer_mem);
                 device_data->vtable.FreeMemory(device_data->device,
                                                draw->index_buffer_mem, NULL);
         }
@@ -940,6 +957,7 @@ void destroy_draw(swapchain_data_t* data, krosshair_draw_t* draw)
                                                        1, &draw->cmd_buffer);
         }
 
+        kh_perflog_host_free(sizeof(*draw), "draw slot");
         free(draw);
 }
 

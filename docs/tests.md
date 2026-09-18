@@ -39,6 +39,7 @@ not a unit test (see "End-to-end" below).
 | `test_input.c` | the pure hotkey/combo logic in `src/input.c`: `parse_hotkey`, `kh_key_index`, `kh_apply_event`, `kh_elapsed_ms`, `kh_update_combo`, `kh_select_timeout_ms`. The evdev scanning / background-thread code is not exercised |
 | `test_gpu.c` | `vk_memory_type()` in `src/gpu.c`: a stub `GetPhysicalDeviceMemoryProperties` vtable returns a synthesized `VkMemoryProperties`, and the suite asserts the selected type index for various requirement/flag combinations |
 | `test_render.c` | the overlay render path in `src/render.c`: fence wait/ready handling, swapchain layout transitions, framebuffer-copy recording, crosshair and dynamic-mask upload sequences, quad-buffer creation, and the submit topology (single same-family submit vs two cross-engine submits) — driven against a recording stub vtable with the built-in crosshair (HOME pointed at an empty directory) |
+| `test_perflog.c` | the memory tracking in `src/perflog.c`: `KROSSHAIR_PERFLOGGING` env-var parsing (unset/`1`/`0`/other), the device-memory handle→size registry (alloc/free by handle, untracked and NULL handles, double-free), and the host-memory running total |
 
 Adding a new suite requires no Makefile change: the `test_*.c` wildcard
 picks it up (linked with `-lm -lpthread`).
@@ -150,6 +151,7 @@ record traced to the mock's own backing, none to the layer.
 | `KROSSHAIR_E2E_CUSTOM_IMG` | Makefile (second e2e run) | tells the test to generate and use the custom APNG |
 | `KROSSHAIR_IMG` | the test itself | the custom image path handed to the layer |
 | `KROSSHAIR_HOTKEY_TOGGLE` | `test_input` | the hotkey under test |
+| `KROSSHAIR_PERFLOGGING=1` | manually | makes the layer print `[KH] perf: ...` lines with running device- and host-memory totals (for leak testing, e.g. under valgrind) |
 
 ## CI
 

@@ -141,6 +141,7 @@ static swapchain_data_t* new_swapchain_data(VkSwapchainKHR swapchain,
 {
         swapchain_data_t* swapchain_data = malloc(sizeof(*swapchain_data));
         memset(swapchain_data, 0, sizeof(*swapchain_data));
+        kh_perflog_host_alloc(sizeof(*swapchain_data), "swapchain data");
         swapchain_data->device_data = device_data;
         swapchain_data->swapchain   = swapchain;
         KROSSHAIR_LOG("[*] mapping data->swapchain obj: %lu %p\n",
@@ -219,6 +220,8 @@ static VkResult overlay_CreateSwapchainKHR(
                 destroy_swapchain_data(old_swapchain_data);
                 unmap_object(HKEY(old_swapchain_data->swapchain));
                 unregister_swapchain(device_data, old_swapchain_data);
+                kh_perflog_host_free(sizeof(swapchain_data_t),
+                                     "swapchain data");
                 free(old_swapchain_data);
         }
 
@@ -277,6 +280,8 @@ static void overlay_DestroySwapchainKHR(VkDevice device,
                 destroy_swapchain_data(data);
                 unmap_object(HKEY(data->swapchain));
                 unregister_swapchain(device_data, data);
+                kh_perflog_host_free(sizeof(swapchain_data_t),
+                                     "swapchain data");
                 free(data);
         }
 
@@ -301,6 +306,7 @@ LAYER_API VkResult overlay_CreateInstance(const VkInstanceCreateInfo* create_inf
                                        VkInstance* instance_out)
 {
         init_input_thread();
+        kh_perflog_init();
 
         VkLayerInstanceCreateInfo* chain_info =
             get_instance_chain_info(create_info, VK_LAYER_LINK_INFO);
@@ -574,6 +580,8 @@ LAYER_API void overlay_DestroyDevice(VkDevice device,
                     "swapchain %lu\n", (unsigned long)sc->swapchain);
                 destroy_swapchain_data(sc);
                 unmap_object(HKEY(sc->swapchain));
+                kh_perflog_host_free(sizeof(swapchain_data_t),
+                                     "swapchain data");
                 free(sc);
         }
 
@@ -583,12 +591,15 @@ LAYER_API void overlay_DestroyDevice(VkDevice device,
         for (uint32_t i = 0; i < device_data->queue_count; i++) {
                 if (device_data->queues[i]) {
                         unmap_object(HKEY(device_data->queues[i]->queue));
+                        kh_perflog_host_free(sizeof(queue_data_t),
+                                             "queue data");
                         free(device_data->queues[i]);
                         device_data->queues[i] = NULL;
                 }
         }
 
         unmap_object(HKEY(device_data->device));
+        kh_perflog_host_free(sizeof(*device_data), "device data");
         free(device_data);
 
         if (chain_destroy) {
@@ -627,6 +638,7 @@ LAYER_API void overlay_DestroyInstance(VkInstance instance,
         unregister_physical_devices(instance_data);
 
         unmap_object(HKEY(instance_data->instance));
+        kh_perflog_host_free(sizeof(*instance_data), "instance data");
         free(instance_data);
 
         if (chain_destroy) {

@@ -299,3 +299,11 @@ void setup_swapchain_data(swapchain_data_t* data, const VkSwapchainCreateInfoKHR
 void device_map_queues(device_data_t* data, const VkDeviceCreateInfo* pCreateInfo);
 void shutdown_krosshair_image(swapchain_data_t* data);
 void shutdown_dynamic_mask(swapchain_data_t* data);
+void kh_perflog_init(void);
+int kh_perflog_enabled(void);
+void kh_perflog_dev_alloc(VkDeviceMemory mem, size_t size);
+void kh_perflog_dev_free(VkDeviceMemory mem);
+void kh_perflog_host_alloc(size_t size, const char* what);
+void kh_perflog_host_free(size_t size, const char* what);
+size_t kh_perflog_dev_total(void);
+size_t kh_perflog_host_total(void);
