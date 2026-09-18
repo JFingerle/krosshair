@@ -40,8 +40,7 @@ old shader.
 ## Style (see `.clang-format`)
 
 - **`UseTab: Never`** — 8-space indentation, no tabs. (Tabs slip in and break the build style;
-  scan for them after edits.) Exception: `src/input.c` is a pre-existing 4-space file —
-  match its local style; leave its indentation alone.
+  scan for them after edits.)
 - `IndentWidth: 8`, `ColumnLimit: 80`, pointer alignment left (`void*`/`char*`, not `void *`).
 - Every function carries a leading `/* ... */` doc comment describing purpose and parameters —
   match this convention when adding functions.
