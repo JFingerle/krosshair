@@ -1,7 +1,7 @@
 # AGENTS.md
 
 krosshair is a **Vulkan implicit layer** (a crosshair overlay for games), not a standalone app.
-There is no binary to run — it compiles to a shared library `lib/krosshair.so` that Vulkan
+There is no binary to run — it compiles to a shared library `lib/krosshair.so` that the Vulkan
 app loader picks up via `krosshair.json` when `KROSSHAIR=1` is set.
 
 ## Build
@@ -17,8 +17,7 @@ make release   # used by PKGBUILD and CI (no -ggdb)
 - **Tests:** `make test` runs the unit suites plus an end-to-end run of the
   layer through the real Vulkan loader against a mock ICD (see
   `docs/tests.md`). There is no linter/typecheck; a dev build must also stay
-  warning-free under `-Wall`. For real-hardware behavior, launch a Vulkan app
-  with the layer, e.g. `KROSSHAIR=1 vkcube`.
+  warning-free under `-Wall`.
 - Entry points live in `src/layer.c` (`overlay_CreateInstance`, `overlay_CreateDevice`,
   `overlay_GetInstanceProcAddr`, `overlay_GetDeviceProcAddr`). The huge command table in
   `src/dispatch.c` is built with the `DISPATCH_LOAD(table, gpa, scope, NAME)` macro — search for
@@ -32,8 +31,8 @@ make release   # used by PKGBUILD and CI (no -ggdb)
 ## Shaders (codegen gotcha)
 
 GLSL sources are in `shaders/*.vert` / `shaders/*.frag`. They are compiled to SPIR-V and
-committed as artifacts: `shaders/*.spv`, `include/shaders.h`, and `shaders/dynamic_spv.h`
-(the latter are `static const unsigned char[]` byte arrays included from `src/gpu.c`).
+committed as artifacts: the `.spv` files in `shaders/` and the byte-array headers
+`include/shaders.h` + `shaders/dynamic_spv.h` (both included from `src/gpu.c`).
 **There is no Makefile target to regenerate them.** If you edit a `.vert`/`.frag`, you must
 recompile GLSL→SPIR-V and regenerate the C byte array manually, or the built layer keeps the
 old shader.
@@ -41,7 +40,8 @@ old shader.
 ## Style (see `.clang-format`)
 
 - **`UseTab: Never`** — 8-space indentation, no tabs. (Tabs slip in and break the build style;
-  scan for them after edits.)
+  scan for them after edits.) Exception: `src/input.c` is a pre-existing 4-space file —
+  match its local style; leave its indentation alone.
 - `IndentWidth: 8`, `ColumnLimit: 80`, pointer alignment left (`void*`/`char*`, not `void *`).
 - Every function carries a leading `/* ... */` doc comment describing purpose and parameters —
   match this convention when adding functions.
@@ -52,7 +52,8 @@ old shader.
   `refactor(layer): ...`, `docs(crosshair): ...`, `chore(input): ...`.
 - Runtime env vars (from `krosshair.json` and README): `KROSSHAIR=1` (enable),
   `DISABLE_KROSSHAIR=1` (disable), `KROSSHAIR_IMG` (custom crosshair),
-  `KROSSHAIR_HOTKEY_TOGGLE` (e.g. `SHIFT_R+F7`).
+  `KROSSHAIR_HOTKEY_TOGGLE` (e.g. `SHIFT_R+F7`), `KROSSHAIR_PERFLOGGING=1`
+  (memory-tracking diagnostics on stderr).
 - `KROSSHAIR_LOG(...)` is a **no-op unless `KROSSHAIR_DEBUG` is defined**; `[KH]`/`[KROSSHAIR_ERROR]`
   lines on stderr are the runtime diagnostics users see.
 
