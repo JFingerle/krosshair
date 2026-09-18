@@ -9,9 +9,9 @@
 
 * Hotkey added to toggle the crosshair (press `SHIFT_R` + `F9`, see `Configuration` chapter below on how to change the hotkey)
 * Rendering fixed on 4K and other resolutions ([PR](https://github.com/noahlyk/krosshair/pull/2))
-* Memory leak fixed
+* Memory leak fixed. VRAM usage is around 33 MiB (34 MB) on a 4K display (with a 4K transparent PNG crosshair, 37 KiB size)
 * Flatpak build added ([PR](https://github.com/noahlyk/krosshair/pull/1))
-* Code refactored and tests added
+* Code refactored and improved, unit tests added
 
 <br>
 
