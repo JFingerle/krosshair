@@ -25,8 +25,7 @@ make release   # used by PKGBUILD and CI (no -ggdb)
 
 ## Documentation
 
-- Project documentation lives in `docs/` — currently `docs/tests.md`, which
-  covers the unit-test suites and the mock-ICD end-to-end setup.
+- Project documentation lives in `docs/`.
 
 ## Shaders (codegen gotcha)
 

@@ -117,6 +117,11 @@ and forwarded. If `/proc/self/maps` shows `krosshair.so` was never mapped
 (the loader-skip case above), the end-to-end angle prints a notice and
 skips with exit 0 instead of failing.
 
+Both runs execute under a scratch `HOME` (`build/e2e_home`), so the
+machine's real default crosshair at `~/.config/crosshair-maker/` is never
+picked up — that keeps which image the layer loads (and thus the
+`max_alloc` assertion) deterministic across machines.
+
 Two runs:
 
 1. **Default angle** — built-in 50x50 crosshair.
@@ -156,9 +161,12 @@ record traced to the mock's own backing, none to the layer.
 
 ## CI
 
-Both workflows (`.github/workflows/pr.yml` and `release.yml`) run
+The github workflows (`.github/workflows/pr.yml` and `release.yml`) run
 `make test` as a dedicated "Run tests" step (after the dependency install,
-before the binary and Flatpak builds).
+before the binary and Flatpak builds). The workflows run on
+`container: archlinux:latest` with the Arch `vulkan-icd-loader` — not bare
+`ubuntu-latest` — because Ubuntu's apt `libvulkan` (1.4.31x–1.4.32x)
+segfaults in `overlay_CreateDevice` during the mock-ICD end-to-end run.
 
 ## Not covered
 
