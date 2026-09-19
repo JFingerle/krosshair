@@ -22,6 +22,10 @@ MOCK_ICD_SO  = $(MOCK_ICD_DIR)/libmock_icd.so
 TEST_CCFLAGS = -Wall -std=c99 -ggdb -DUNIT_TEST -I./include/ -I./tests
 
 BUILD_DIR = build
+# Scratch HOME for the e2e runs, so they never pick up the user's real
+# ~/.config/crosshair-maker crosshair (keeps the max_alloc assertion
+# deterministic across machines). Must not match the test_* run glob.
+TEST_HOME = $(BUILD_DIR)/e2e_home
 FLATPAK_BUILD_DIR = $(BUILD_DIR)/flatpak
 FLATPAK_BUILD_DIR_INTERMEDIATE = $(FLATPAK_BUILD_DIR)/intermediate
 FLATPAK_EXPORT_DIR = $(FLATPAK_BUILD_DIR_INTERMEDIATE)/export
@@ -85,9 +89,9 @@ test: all
 	# Some packaged loaders (Debian 1.4.309, Arch 1.4.357) silently skip
 	# layers found via VK_LAYER_PATH, so the manifest is also placed in
 	# the standard per-user implicit layer dir and removed afterwards.
-	@mkdir -p "$(HOME)/.config/vulkan/implicit_layer.d" && cp $(BUILD_DIR)/vk_layer_path/krosshair.json "$(HOME)/.config/vulkan/implicit_layer.d/" && { VK_LAYER_PATH=$(BUILD_DIR)/vk_layer_path VK_DRIVER_FILES=$(MOCK_ICD_DIR)/mock_icd.json KROSSHAIR=1 MOCK_ICD_SO=$(CURDIR)/$(MOCK_ICD_SO) $(BUILD_DIR)/test_mock_icd; rc=$$?; rm -f "$(HOME)/.config/vulkan/implicit_layer.d/krosshair.json"; exit $$rc; }
+	@mkdir -p "$(TEST_HOME)/.config/vulkan/implicit_layer.d" && cp $(BUILD_DIR)/vk_layer_path/krosshair.json "$(TEST_HOME)/.config/vulkan/implicit_layer.d/" && { HOME=$(TEST_HOME) VK_LAYER_PATH=$(BUILD_DIR)/vk_layer_path VK_DRIVER_FILES=$(MOCK_ICD_DIR)/mock_icd.json KROSSHAIR=1 MOCK_ICD_SO=$(CURDIR)/$(MOCK_ICD_SO) $(BUILD_DIR)/test_mock_icd; rc=$$?; rm -f "$(TEST_HOME)/.config/vulkan/implicit_layer.d/krosshair.json"; exit $$rc; }
 	echo "== running $(BUILD_DIR)/test_mock_icd (custom APNG crosshair)"
-	@mkdir -p "$(HOME)/.config/vulkan/implicit_layer.d" && cp $(BUILD_DIR)/vk_layer_path/krosshair.json "$(HOME)/.config/vulkan/implicit_layer.d/" && { VK_LAYER_PATH=$(BUILD_DIR)/vk_layer_path VK_DRIVER_FILES=$(MOCK_ICD_DIR)/mock_icd.json KROSSHAIR=1 KROSSHAIR_E2E_CUSTOM_IMG=1 MOCK_ICD_SO=$(CURDIR)/$(MOCK_ICD_SO) $(BUILD_DIR)/test_mock_icd; rc=$$?; rm -f "$(HOME)/.config/vulkan/implicit_layer.d/krosshair.json"; exit $$rc; }
+	@mkdir -p "$(TEST_HOME)/.config/vulkan/implicit_layer.d" && cp $(BUILD_DIR)/vk_layer_path/krosshair.json "$(TEST_HOME)/.config/vulkan/implicit_layer.d/" && { HOME=$(TEST_HOME) VK_LAYER_PATH=$(BUILD_DIR)/vk_layer_path VK_DRIVER_FILES=$(MOCK_ICD_DIR)/mock_icd.json KROSSHAIR=1 KROSSHAIR_E2E_CUSTOM_IMG=1 MOCK_ICD_SO=$(CURDIR)/$(MOCK_ICD_SO) $(BUILD_DIR)/test_mock_icd; rc=$$?; rm -f "$(TEST_HOME)/.config/vulkan/implicit_layer.d/krosshair.json"; exit $$rc; }
 
 install:
 	sudo mkdir -p /usr/lib/krosshair
