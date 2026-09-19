@@ -113,7 +113,7 @@ jobs:
             PKGBUILD
             aur/
             krosshair-linux-*.tar.gz
-            krosshair-linux-*.sha264
+            krosshair-linux-*.sha265
 
   build-flatpak:
     # Runs on a bare runner (no container): the flatpak build needs
