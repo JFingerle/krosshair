@@ -69,21 +69,16 @@ jobs:
     container: archlinux:latest
     steps:
       - name: Install system dependencies
-        run: pacman -Syu --noconfirm base-devel vulkan-headers vulkan-icd-loader libx11 libgl git flatpak-builder flatpak
+        run: pacman -Syu --noconfirm base-devel vulkan-headers vulkan-icd-loader libx11 libgl git
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Mark workspace as trusted for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - name: Enable Flathub remote
-        run: |
-          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
       - name: Run tests
         run: make test
       - name: Build binary
         run: make release
-      - name: Build flatpak
-        run: make flatpak-build
       - name: Determine architecture
         id: arch
         run: |
@@ -118,11 +113,34 @@ jobs:
             PKGBUILD
             aur/
             krosshair-linux-*.tar.gz
-            krosshair-linux-*.sha256
-            build/flatpak/*.flatpak
+            krosshair-linux-*.sha264
+
+  build-flatpak:
+    # Runs on a bare runner (no container): the flatpak build needs
+    # /dev/fuse (rofiles-fuse), which GitHub job containers don't expose.
+    # The layer itself is compiled inside the flatpak SDK sandbox, so the
+    # host only needs flatpak, flatpak-builder and git.
+    needs: [version]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak-builder flatpak
+      - uses: actions/checkout@v5
+      - name: Enable Flathub remote
+        run: |
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+      - name: Build flatpak
+        run: make flatpak-build
+      - name: Upload flatpak bundles
+        uses: actions/upload-artifact@v6
+        with:
+          name: flatpak-bundles
+          path: build/flatpak/*.flatpak
 
   release:
-    needs: [version, build]
+    needs: [version, build, build-flatpak]
     runs-on: ubuntu-latest
     container: archlinux:latest
     permissions:
@@ -138,6 +156,10 @@ jobs:
         with:
           name: build-output
           path: .
+      - uses: actions/download-artifact@v7
+        with:
+          name: flatpak-bundles
+          path: build/flatpak
       - name: Configure git
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
