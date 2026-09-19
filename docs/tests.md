@@ -148,6 +148,7 @@ record traced to the mock's own backing, none to the layer.
 | `VK_DRIVER_FILES` | Makefile test target | pins the mock ICD as the only driver |
 | `VK_LAYER_PATH` | Makefile test target | points the loader at the build-tree layer manifest |
 | `MOCK_ICD_SO` | Makefile test target | absolute path of `libmock_icd.so`; the test dlopens it to read `mock_icd_get_stats` |
+| `MOCK_ICD_DEBUG` | manually | makes the mock ICD print its `[mock-icd] ...` dispatch trace (gpa misses, extension queries, negotiation); hidden by default to keep `make test` output clean |
 | `KROSSHAIR_E2E_CUSTOM_IMG` | Makefile (second e2e run) | tells the test to generate and use the custom APNG |
 | `KROSSHAIR_IMG` | the test itself | the custom image path handed to the layer |
 | `KROSSHAIR_HOTKEY_TOGGLE` | `test_input` | the hotkey under test |

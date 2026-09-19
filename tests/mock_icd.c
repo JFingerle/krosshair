@@ -17,6 +17,19 @@
 #include <vulkan/vk_layer.h>
 #include <vulkan/vulkan.h>
 
+/* Opt-in diagnostics for the mock ICD. Hidden by default so `make test`
+ * output stays readable; set MOCK_ICD_DEBUG to trace the dispatch. */
+static int mock_verbose(void)
+{
+        static int verbose = -1;
+
+        if (verbose < 0)
+                verbose = getenv("MOCK_ICD_DEBUG") != NULL;
+        return verbose;
+}
+
+#define MKLOG(...) do { if (mock_verbose()) fprintf(stderr, __VA_ARGS__); } while (0)
+
 /*
  * The loader requires ICD handles to be pointers to real objects whose
  * first 8 bytes hold ICD_LOADER_MAGIC (see vk_icd.h); the loader overwrites
@@ -693,7 +706,7 @@ static PFN_vkVoidFunction mock_device_gpa(VkDevice device,
                 return (PFN_vkVoidFunction)mock_update_descriptor_sets;
         if (!strcmp(func_name, "vkWaitForFences"))
                 return (PFN_vkVoidFunction)mock_wait_fences;
-        fprintf(stderr, "[mock-icd] device gpa miss: %s\n", func_name);
+        MKLOG("[mock-icd] device gpa miss: %s\n", func_name);
         return NULL;
 }
 
@@ -1098,11 +1111,11 @@ static VkResult mock_enumerate_device_extensions(
 {
         (void)physical_device;
         (void)layer_name;
-        fprintf(stderr, "[mock-icd] enumerate_device_extensions: count query=%d\n",
+        MKLOG("[mock-icd] enumerate_device_extensions: count query=%d\n",
                 properties == NULL);
         if (!properties) {
                 *property_count = 1;
-                fprintf(stderr, "[mock-icd] enumerate_device_extensions: returning SUCCESS, count=1\n");
+                MKLOG("[mock-icd] enumerate_device_extensions: returning SUCCESS, count=1\n");
                 return VK_SUCCESS;
         }
         if (*property_count >= 1) {
@@ -1174,7 +1187,7 @@ static PFN_vkVoidFunction mock_icd_get_physical_device_proc_addr(
 {
         (void)physical_device;
         if (func_name)
-                fprintf(stderr, "[mock-icd] pd gpa miss: %s\n", func_name);
+                MKLOG("[mock-icd] pd gpa miss: %s\n", func_name);
         return NULL;
 }
 
@@ -1296,7 +1309,7 @@ vk_icdGetInstanceProcAddr(VkInstance instance, const char* func_name)
                 return (PFN_vkVoidFunction)mock_create_device;
         if (!strcmp(func_name, "vkDestroyDevice"))
                 return (PFN_vkVoidFunction)mock_destroy_device;
-        fprintf(stderr, "[mock-icd] instance gpa miss: %s\n", func_name);
+        MKLOG("[mock-icd] instance gpa miss: %s\n", func_name);
         return NULL;
 }
 
@@ -1319,8 +1332,7 @@ VkResult vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t* pVersion)
                 *pVersion = CURRENT_LOADER_ICD_INTERFACE_VERSION;
         else
                 *pVersion = requested;
-        fprintf(stderr,
-                "[mock-icd] negotiate: loader wants v%u, ICD offers v%u\n",
+        MKLOG("[mock-icd] negotiate: loader wants v%u, ICD offers v%u\n",
                 requested, *pVersion);
         return VK_SUCCESS;
 }
