@@ -66,12 +66,10 @@ jobs:
   build:
     needs: [version]
     runs-on: ubuntu-latest
+    container: archlinux:latest
     steps:
       - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libvulkan-dev libvulkan1 \
-               libx11-dev libgl1-mesa-dev git flatpak-builder flatpak
+        run: pacman -Syu --noconfirm base-devel vulkan-headers vulkan-icd-loader libx11 libgl git flatpak-builder flatpak
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
