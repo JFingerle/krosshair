@@ -105,6 +105,8 @@ jobs:
           cp -r crosshairs/* krosshair-linux-${ARCH_NAME}/crosshairs/ 2>/dev/null || true
           tar -czf krosshair-linux-${ARCH_NAME}.tar.gz -C krosshair-linux-${ARCH_NAME} .
           sha256sum krosshair-linux-${ARCH_NAME}.tar.gz > krosshair-linux-${ARCH_NAME}.sha256
+          test -f krosshair-linux-${ARCH_NAME}.tar.gz
+          test -f krosshair-linux-${ARCH_NAME}.sha256
       - name: Upload build artifacts
         uses: actions/upload-artifact@v6
         with:
@@ -114,7 +116,7 @@ jobs:
             PKGBUILD
             aur/
             krosshair-linux-*.tar.gz
-            krosshair-linux-*.sha265
+            krosshair-linux-*.sha256
 
   build-flatpak:
     # Runs on a bare runner (no container): the flatpak build needs
