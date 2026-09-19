@@ -31,13 +31,19 @@ This is an overlay (not really a crosshair) which helps against motion sickness 
 
 # Installation
 
-## Non-Flatpak Installation
+## Native / Non-Flatpak Installation
 
-## <del>Option 1: Via Arch Linux AUR</del>
+### Option 1: Download Release and Install manually
 
-This fork (jfingerle/krosshair) is currently not available on the AUR.
+- Download the [latest `krosshair-linux-x86_64.tar.gz` release](https://github.com/JFingerle/krosshair/releases/latest)
+- Run the following commands to copy the files to their destinations:
+  ```
+  sudo mkdir /usr/lib/krosshair/
+  sudo cp krosshair.so /usr/lib/krosshair/krosshair.so
+  sudo cp krosshair.json /usr/share/vulkan/implicit_layer.d/krosshair.json
+  ```
 
-## Option 2: Build from Source
+### Option 2: Build and Install from Source
 
 ```bash
 git clone https://github.com/jfingerle/krosshair.git
